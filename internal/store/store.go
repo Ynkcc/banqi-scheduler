@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -121,11 +122,20 @@ func (s *Store) migrate() error {
 			id TEXT PRIMARY KEY,
 			last_seen INTEGER NOT NULL,
 			threads INTEGER NOT NULL DEFAULT 0,
-			completed_games INTEGER NOT NULL DEFAULT 0
+			completed_games INTEGER NOT NULL DEFAULT 0,
+			client_version TEXT NOT NULL DEFAULT '',
+			memory_mb INTEGER NOT NULL DEFAULT 0
 		)`,
+		// 旧库升级：workers 表补列（已存在时忽略错误）
+		`ALTER TABLE workers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE workers ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.Exec(q); err != nil {
+			// 容忍旧库升级时列已存在
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
 			return fmt.Errorf("exec %q: %w", q[:40], err)
 		}
 	}
@@ -250,12 +260,26 @@ func (s *Store) InsertEpisode(e Episode) error {
 	return nil
 }
 
-func (s *Store) TouchWorker(id string, threads, completedGames int) error {
-	_, err := s.db.Exec(`INSERT INTO workers (id, last_seen, threads, completed_games) VALUES (?,?,?,?)
-		ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, threads=excluded.threads, completed_games=excluded.completed_games`,
-		id, time.Now().Unix(), threads, completedGames)
+func (s *Store) TouchWorker(id string, threads, completedGames int, clientVersion string, memoryMb int64) error {
+	_, err := s.db.Exec(`INSERT INTO workers (id, last_seen, threads, completed_games, client_version, memory_mb) VALUES (?,?,?,?,?,?)
+		ON CONFLICT(id) DO UPDATE SET last_seen=excluded.last_seen, threads=excluded.threads, completed_games=excluded.completed_games,
+		client_version=excluded.client_version, memory_mb=excluded.memory_mb`,
+		id, time.Now().Unix(), threads, completedGames, clientVersion, memoryMb)
 	if err != nil {
 		return fmt.Errorf("touch worker %s: %w", id, err)
 	}
 	return nil
+}
+
+// WorkerVersion 返回该 worker 最近一次上报的版本声明
+func (s *Store) WorkerVersion(id string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT client_version FROM workers WHERE id=?`, id).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("worker version %s: %w", id, err)
+	}
+	return v, nil
 }

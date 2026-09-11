@@ -23,6 +23,7 @@ type config struct {
 	r2Bucket    string
 	gamesPerTask int
 	gatekeeperGames int
+	threadsBaseline int
 	elo0, elo1, alpha, beta float64
 	minClientVersion string
 }
@@ -35,6 +36,7 @@ func loadConfig() config {
 		r2Bucket:        envOr("SCHEDULER_R2_BUCKET", "banqi"),
 		gamesPerTask:    envInt("SCHEDULER_GAMES_PER_TASK", 16),
 		gatekeeperGames: envInt("SCHEDULER_GATEKEEPER_PAIRS", 400),
+		threadsBaseline: envInt("SCHEDULER_THREADS_BASELINE", 0),
 		elo0:            envFloat("SCHEDULER_SPRT_ELO0", 0),
 		elo1:            envFloat("SCHEDULER_SPRT_ELO1", 30),
 		alpha:           envFloat("SCHEDULER_SPRT_ALPHA", 0.05),
@@ -76,7 +78,7 @@ func main() {
 	flag.Parse()
 	if *showHelp {
 		log.Println("env: SCHEDULER_LISTEN, SCHEDULER_VARIANT, SCHEDULER_DB, SCHEDULER_R2_BUCKET,",
-			"SCHEDULER_GAMES_PER_TASK, SCHEDULER_GATEKEEPER_PAIRS,",
+			"SCHEDULER_GAMES_PER_TASK, SCHEDULER_GATEKEEPER_PAIRS, SCHEDULER_THREADS_BASELINE,",
 			"SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
 			"SCHEDULER_MIN_CLIENT_VERSION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3")
 		return
@@ -99,6 +101,7 @@ func main() {
 		Variant:          cfg.variant,
 		GamesPerTask:     cfg.gamesPerTask,
 		GatekeeperGames:  cfg.gatekeeperGames,
+		ThreadsBaseline:  cfg.threadsBaseline,
 		SprtElo0:         cfg.elo0,
 		SprtElo1:         cfg.elo1,
 		SprtAlpha:        cfg.alpha,

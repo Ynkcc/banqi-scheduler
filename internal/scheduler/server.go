@@ -25,6 +25,23 @@ type Config struct {
 	SprtAlpha         float64
 	SprtBeta          float64
 	MinClientVersion  string
+	ThreadsBaseline   int     // 资源分配基准线程数：games = GamesPerTask × threads/baseline（<=0 则不缩放）
+}
+
+// gamesFor 按 worker 线程数缩放本批局数（资源分配；threads<=0 视为 1）。
+func (s *Server) gamesFor(threads int32) int32 {
+	if s.cfg.ThreadsBaseline <= 0 {
+		return int32(s.cfg.GamesPerTask)
+	}
+	t := int(threads)
+	if t < 1 {
+		t = 1
+	}
+	g := s.cfg.GamesPerTask * t / s.cfg.ThreadsBaseline
+	if g < 1 {
+		g = 1
+	}
+	return int32(g)
 }
 
 type runningTask struct {
@@ -68,6 +85,9 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	if s.cfg.MinClientVersion != "" && req.ClientVersion != "" && req.ClientVersion < s.cfg.MinClientVersion {
 		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "client_version_too_old"}, nil
 	}
+	if req.ClientVersion != "" {
+		log.Printf("[task] worker=%s version=%s threads=%d memory_mb=%d", req.WorkerId, req.ClientVersion, req.Threads, req.MemoryMb)
+	}
 
 	// 优先下发未完结的 gatekeeper 对打（lczero target_slice 模式）
 	m, err := s.store.PendingMatch()
@@ -102,7 +122,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		Kind:              pb.TaskKind_TASK_SELFPLAY,
 		NetworkSha:        best.Sha,
 		NetworkShaRemote:  best.Sha,
-		Games:             int32(s.cfg.GamesPerTask),
+		Games:             s.gamesFor(req.Threads),
 		Params:            &pb.SelfPlayParams{Variant: s.cfg.Variant},
 	}
 	if req.CurrentNetwork != best.Sha {
@@ -125,8 +145,8 @@ func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, 
 		remaining = 2
 	}
 	games := remaining
-	if games > s.cfg.GamesPerTask {
-		games = s.cfg.GamesPerTask
+	if scaled := s.gamesFor(req.Threads); int(scaled) < games {
+		games = int(scaled)
 	}
 	resp := &pb.TaskResponse{
 		TaskId:           taskID,
@@ -156,6 +176,9 @@ func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.Ep
 	s.mu.Unlock()
 	if !ok {
 		return &pb.EpisodeAck{Accepted: false, Message: "unknown_task_id:" + req.TaskId}, nil
+	}
+	if task.WorkerID != req.WorkerId {
+		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
 	}
 	if task.NetworkSha != req.NetworkSha {
 		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("network_sha_mismatch task=%s got=%s", task.NetworkSha, req.NetworkSha)}, nil
@@ -239,6 +262,9 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 	if !ok {
 		return &pb.MatchResultAck{Accepted: false, Message: "unknown_task_id:" + req.TaskId}, nil
 	}
+	if task.WorkerID != req.WorkerId {
+		return &pb.MatchResultAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
+	}
 	if task.Kind != pb.TaskKind_TASK_RATING {
 		return &pb.MatchResultAck{Accepted: false, Message: "task_is_not_rating"}, nil
 	}
@@ -311,8 +337,14 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 }
 
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatReply, error) {
-	if err := s.store.TouchWorker(req.WorkerId, int(req.CurrentThreads), int(req.CompletedGames)); err != nil {
+	if err := s.store.TouchWorker(req.WorkerId, int(req.CurrentThreads), int(req.CompletedGames),
+		req.ClientVersion, req.MemoryMb); err != nil {
 		return nil, err
+	}
+	if req.ClientVersion != "" {
+		if v, err := s.store.WorkerVersion(req.WorkerId); err == nil && v != "" && v != req.ClientVersion {
+			log.Printf("[worker] %s version changed %s -> %s", req.WorkerId, v, req.ClientVersion)
+		}
 	}
 	best, err := s.store.GetBest()
 	if err != nil {
