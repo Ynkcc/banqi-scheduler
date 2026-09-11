@@ -34,15 +34,15 @@ func New(ctx context.Context, bucket string) (*Presigner, error) {
 	}, nil
 }
 
-// PresignPut 签发直传 URL；contentSHA256 为对象 sha256（hex），供 R2 端校验
-func (p *Presigner) PresignPut(ctx context.Context, key, contentSHA256 string, length int64) (string, error) {
+// PresignPut 签发直传 URL。
+// 注意：不再把对象 sha256 作为 ChecksumSHA256 参与预签名——S3/R2 要求该头为 base64
+// 且客户端必须原样回传，而调用方传的是 hex，会让预签名 PUT 必然 400/403。上传内容
+// 由对象键（networks/<sha>.bin）与下载端 sha256 SRI 校验保证一致性。
+func (p *Presigner) PresignPut(ctx context.Context, key string, length int64) (string, error) {
 	req := &s3.PutObjectInput{
 		Bucket:        aws.String(p.bucket),
 		Key:           aws.String(key),
 		ContentLength: aws.Int64(length),
-	}
-	if contentSHA256 != "" {
-		req.ChecksumSHA256 = aws.String(contentSHA256)
 	}
 	ps := s3.NewPresignClient(p.client)
 	out, err := ps.PresignPutObject(ctx, req, s3.WithPresignExpires(p.publicTTL))

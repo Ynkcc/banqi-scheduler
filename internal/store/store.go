@@ -144,27 +144,31 @@ func (s *Store) migrate() error {
 
 func (s *Store) GetBest() (*Network, error) {
 	n := &Network{}
+	var createdAt int64
 	err := s.db.QueryRow(`SELECT sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'') FROM networks WHERE is_best=1 LIMIT 1`).
-		Scan(&n.Sha, &n.ParentSha, &n.CreatedAt, &n.IsBest, &n.Status, &n.Notes)
+		Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get best network: %w", err)
 	}
+	n.CreatedAt = time.Unix(createdAt, 0)
 	return n, nil
 }
 
 func (s *Store) GetNetwork(sha string) (*Network, error) {
 	n := &Network{}
+	var createdAt int64
 	err := s.db.QueryRow(`SELECT sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'') FROM networks WHERE sha=?`, sha).
-		Scan(&n.Sha, &n.ParentSha, &n.CreatedAt, &n.IsBest, &n.Status, &n.Notes)
+		Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get network %s: %w", sha, err)
 	}
+	n.CreatedAt = time.Unix(createdAt, 0)
 	return n, nil
 }
 

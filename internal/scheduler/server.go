@@ -184,7 +184,7 @@ func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.Ep
 		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("network_sha_mismatch task=%s got=%s", task.NetworkSha, req.NetworkSha)}, nil
 	}
 	key := r2.EpisodeKey(req.NetworkSha, newID())
-	url, err := s.r2.PresignPut(ctx, key, req.ContentSha256, req.ContentLength)
+	url, err := s.r2.PresignPut(ctx, key, req.ContentLength)
 	if err != nil {
 		return nil, err
 	}
@@ -366,7 +366,7 @@ func (s *Server) SignNetworkUpload(ctx context.Context, req *pb.SignNetworkUploa
 			Message: fmt.Sprintf("invalid_sha_len=%d (want 64 hex chars)", len(sha))}, nil
 	}
 	key := r2.NetworkKey(sha)
-	url, err := s.r2.PresignPut(ctx, key, req.ContentSha256, req.ContentLength)
+	url, err := s.r2.PresignPut(ctx, key, req.ContentLength)
 	if err != nil {
 		return nil, err
 	}
