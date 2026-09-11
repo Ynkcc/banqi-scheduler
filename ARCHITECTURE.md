@@ -1,13 +1,13 @@
 # ARCHITECTURE — banqi-scheduler（Go 中心调度器）
 
-> **仓库规划**：本目录（`server/` + 根 `proto/scheduler.proto` + `deploy/`）计划拆分为独立仓库 `banqi-scheduler`。
-> 拆分前随主仓库维护，本文档即拆出后的架构文档；本文与主仓库 `docs/ARCHITECTURE.md` §6.4 对应，以本文为准。
+> **仓库状态**：已从主仓库 `rust_4x8`（`server/` 子树，含完整提交历史）拆分为独立私有仓库 `Ynkcc/banqi-scheduler`。
+> 主仓库侧对应文档为 `docs/ARCHITECTURE.md` §6.4（拆分后的引用摘要）。
 
 ## 1. 定位
 
 分布式自对弈训练的中心调度器：任务分发（selfplay/rating）、网络登记与晋级、episode 元数据登记 + R2 预签名直传、五项 GSPRT 判停。
 
-调研结论（`../docs/distributed_training_reference_survey.md`）落地：lczero 拉取式调度 + KataGo URL 下发/预签名直传 + fishtest/pentanomial 五项 GSPRT 判停。
+调研结论（主仓库 `docs/distributed_training_reference_survey.md`）落地：lczero 拉取式调度 + KataGo URL 下发/预签名直传 + fishtest/pentanomial 五项 GSPRT 判停。
 技术栈：Go + grpc-go + SQLite（modernc 纯 Go 驱动，WAL）+ aws-sdk-go-v2 S3 预签名（R2 兼容，凭据走标准 `AWS_*` 环境变量）。
 
 ## 2. 结构
@@ -21,7 +21,7 @@
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
 | `internal/scheduler` | gRPC 服务实现 + 任务表（内存 task_id 注册校验） |
 | `pb/` | protoc 生成代码（不提交） |
-| `../proto/scheduler.proto` | 契约源文件（**拆分时迁入本仓库**；主仓库 Rust build.rs 目前也编译它，拆分后主仓库改为引用本仓库的 proto 副本或直接拷贝） |
+| `proto/scheduler.proto` | 契约源文件（已随拆分迁入；主仓库 `build.rs` 仍编译自己的 `proto/scheduler.proto` 副本，proto 变更需双侧同步） |
 
 ## 3. gRPC 契约（scheduler.proto，9 RPC）
 
@@ -40,12 +40,11 @@
 ## 4. proto 生成
 
 ```
-protoc --proto_path=proto --go_out=server --go_opt=module=banqi/server \
-  --go-grpc_out=server --go-grpc_opt=module=banqi/server scheduler.proto
+protoc --proto_path=proto --go_out=. --go_opt=module=banqi/server \
+  --go-grpc_out=. --go-grpc_opt=module=banqi/server proto/scheduler.proto
 ```
-
-（拆分后 `--go_out=.` 并去掉 module 前缀。）
 
 ## 5. 变更记录
 
 - 2026-09-11：从主仓库 `docs/ARCHITECTURE.md` §6.4 拆出，作为未来独立仓库的架构文档。
+- 2026-09-11：经 `git subtree split` 自主仓库 `server/` 拆出为独立仓库（保留完整提交历史）；`proto/scheduler.proto` 迁入本仓库。
