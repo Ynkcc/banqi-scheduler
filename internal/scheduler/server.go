@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 )
 
 type Config struct {
+	Variant           string  // 服务端下发的变体（4x8 / 4x4 / mini）
 	GamesPerTask      int     // selfplay 每次下发的局数
 	GatekeeperGames   int     // gatekeeper 对打目标局数（成对）
 	SprtElo0          float64
@@ -57,6 +59,11 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
+// GetInfo 下发调度器全局信息（trainer 启动时获取变体，worker 零配置）。
+func (s *Server) GetInfo(ctx context.Context, req *pb.GetInfoRequest) (*pb.GetInfoReply, error) {
+	return &pb.GetInfoReply{Variant: s.cfg.Variant}, nil
+}
+
 func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error) {
 	if s.cfg.MinClientVersion != "" && req.ClientVersion != "" && req.ClientVersion < s.cfg.MinClientVersion {
 		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "client_version_too_old"}, nil
@@ -96,7 +103,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		NetworkSha:        best.Sha,
 		NetworkShaRemote:  best.Sha,
 		Games:             int32(s.cfg.GamesPerTask),
-		Params:            &pb.SelfPlayParams{Variant: "4x8"},
+		Params:            &pb.SelfPlayParams{Variant: s.cfg.Variant},
 	}
 	if req.CurrentNetwork != best.Sha {
 		url, err := s.r2.PresignGet(ctx, r2.NetworkKey(best.Sha))
@@ -128,7 +135,7 @@ func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, 
 		OpponentSha:      m.Opponent,
 		NetworkShaRemote: m.Candidate,
 		Games:            int32(games),
-		Params:           &pb.SelfPlayParams{Variant: "4x8"},
+		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant},
 	}
 	candidateURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Candidate))
 	if err != nil {
@@ -315,5 +322,40 @@ func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.H
 	if best != nil {
 		reply.BestNetwork = best.Sha
 	}
+	return reply, nil
+}
+
+// SignNetworkUpload 为 trainer 签发网络直传 R2 的预签名 PUT。
+// R2 凭据只在调度器持有：对象键由 sha 决定（networks/<sha>.bin），trainer 零存储配置。
+func (s *Server) SignNetworkUpload(ctx context.Context, req *pb.SignNetworkUploadRequest) (*pb.SignNetworkUploadAck, error) {
+	sha := strings.TrimSpace(req.Sha)
+	if len(sha) != 64 {
+		return &pb.SignNetworkUploadAck{Accepted: false,
+			Message: fmt.Sprintf("invalid_sha_len=%d (want 64 hex chars)", len(sha))}, nil
+	}
+	key := r2.NetworkKey(sha)
+	url, err := s.r2.PresignPut(ctx, key, req.ContentSha256, req.ContentLength)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("[network] sign upload trainer=%s sha=%s len=%d", req.TrainerId, sha, req.ContentLength)
+	return &pb.SignNetworkUploadAck{Accepted: true, UploadUrl: url, ObjectKey: key}, nil
+}
+
+// ListEpisodes 游标分页下发已登记 episode 的预签名 GET 列表（trainer 消费端）。
+func (s *Server) ListEpisodes(ctx context.Context, req *pb.ListEpisodesRequest) (*pb.ListEpisodesReply, error) {
+	keys, err := s.store.ListEpisodeKeys(req.AfterKey, int(req.Limit))
+	if err != nil {
+		return nil, err
+	}
+	reply := &pb.ListEpisodesReply{}
+	for _, k := range keys {
+		url, err := s.r2.PresignGet(ctx, k)
+		if err != nil {
+			return nil, err
+		}
+		reply.Objects = append(reply.Objects, &pb.EpisodeObject{ObjectKey: k, DownloadUrl: url})
+	}
+	reply.HasMore = len(keys) == int(req.Limit) && req.Limit > 0
 	return reply, nil
 }

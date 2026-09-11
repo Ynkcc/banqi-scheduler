@@ -39,6 +39,30 @@ type Episode struct {
 	CreatedAt  time.Time
 }
 
+// ListEpisodeKeys 游标分页列出已登记的 episode 对象键（字典序递增）。
+// afterKey 为上次返回的最后一个键；limit<=0 时取默认 200。
+func (s *Store) ListEpisodeKeys(afterKey string, limit int) ([]string, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.Query(
+		`SELECT object_key FROM episodes WHERE object_key > ? ORDER BY object_key ASC LIMIT ?`,
+		afterKey, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list episode keys: %w", err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, fmt.Errorf("scan episode key: %w", err)
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
 type Store struct {
 	db *sql.DB
 }

@@ -18,6 +18,7 @@ import (
 
 type config struct {
 	listen      string
+	variant     string
 	sqlitePath  string
 	r2Bucket    string
 	gamesPerTask int
@@ -29,6 +30,7 @@ type config struct {
 func loadConfig() config {
 	c := config{
 		listen:          envOr("SCHEDULER_LISTEN", ":50052"),
+		variant:         envOr("SCHEDULER_VARIANT", "4x8"),
 		sqlitePath:      envOr("SCHEDULER_DB", "scheduler.db"),
 		r2Bucket:        envOr("SCHEDULER_R2_BUCKET", "banqi"),
 		gamesPerTask:    envInt("SCHEDULER_GAMES_PER_TASK", 16),
@@ -73,7 +75,7 @@ func main() {
 	showHelp := flag.Bool("h", false, "show environment variable help")
 	flag.Parse()
 	if *showHelp {
-		log.Println("env: SCHEDULER_LISTEN, SCHEDULER_DB, SCHEDULER_R2_BUCKET,",
+		log.Println("env: SCHEDULER_LISTEN, SCHEDULER_VARIANT, SCHEDULER_DB, SCHEDULER_R2_BUCKET,",
 			"SCHEDULER_GAMES_PER_TASK, SCHEDULER_GATEKEEPER_PAIRS,",
 			"SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
 			"SCHEDULER_MIN_CLIENT_VERSION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3")
@@ -94,6 +96,7 @@ func main() {
 	}
 
 	srv := scheduler.New(scheduler.Config{
+		Variant:          cfg.variant,
 		GamesPerTask:     cfg.gamesPerTask,
 		GatekeeperGames:  cfg.gatekeeperGames,
 		SprtElo0:         cfg.elo0,
