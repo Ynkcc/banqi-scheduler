@@ -1,0 +1,12 @@
+# ---- 调度器本地配置（含 R2 凭据，不提交） ----
+config.env
+
+# ---- 本地构建产物 / e2e 运行时 ----
+scheduler_bin
+_e2e_scheduler.db
+_e2e_scheduler.db-shm
+_e2e_scheduler.db-wal
+_e2e_scheduler.pid
+
+# ---- protoc 生成代码 ----
+pb/
