@@ -26,6 +26,15 @@ type Config struct {
 	SprtBeta          float64
 	MinClientVersion  string
 	ThreadsBaseline   int     // 资源分配基准线程数：games = GamesPerTask × threads/baseline（<=0 则不缩放）
+	InitialRevealed   int     // 课程学习：初始预翻棋子数（<=0 时不下发，用变体默认值）
+}
+
+// extraConfig 生成 SelfPlayParams.extra_config（JSON 透传）；无课程参数时为空串。
+func (s *Server) extraConfig() string {
+	if s.cfg.InitialRevealed <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(`{"initial_revealed_pieces":%d}`, s.cfg.InitialRevealed)
 }
 
 // gamesFor 按 worker 线程数缩放本批局数（资源分配；threads<=0 视为 1）。
@@ -123,7 +132,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		NetworkSha:        best.Sha,
 		NetworkShaRemote:  best.Sha,
 		Games:             s.gamesFor(req.Threads),
-		Params:            &pb.SelfPlayParams{Variant: s.cfg.Variant},
+		Params:            &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
 	}
 	if req.CurrentNetwork != best.Sha {
 		url, err := s.r2.PresignGet(ctx, r2.NetworkKey(best.Sha))
@@ -155,7 +164,7 @@ func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, 
 		OpponentSha:      m.Opponent,
 		NetworkShaRemote: m.Candidate,
 		Games:            int32(games),
-		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant},
+		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
 	}
 	candidateURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Candidate))
 	if err != nil {
