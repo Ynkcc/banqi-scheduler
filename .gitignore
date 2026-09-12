@@ -10,3 +10,9 @@ _e2e_scheduler.pid
 
 # ---- protoc 生成代码 ----
 pb/
+
+# ---- WebUI ----
+webui/node_modules/
+# 前端构建产物（由 webui/ 构建后 embed 进二进制）
+internal/api/dist/*
+!internal/api/dist/.gitkeep

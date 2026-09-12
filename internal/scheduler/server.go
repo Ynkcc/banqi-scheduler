@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -17,24 +18,25 @@ import (
 )
 
 type Config struct {
-	Variant           string  // 服务端下发的变体（4x8 / 4x4 / mini）
-	GamesPerTask      int     // selfplay 每次下发的局数
-	GatekeeperGames   int     // gatekeeper 对打目标局数（成对）
-	SprtElo0          float64
-	SprtElo1          float64
-	SprtAlpha         float64
-	SprtBeta          float64
-	MinClientVersion  string
-	ThreadsBaseline   int     // 资源分配基准线程数：games = GamesPerTask × threads/baseline（<=0 则不缩放）
-	InitialRevealed   int     // 课程学习：初始预翻棋子数（<=0 时不下发，用变体默认值）
+	Variant          string // 服务端下发的变体（4x8 / 4x4 / mini）
+	GamesPerTask     int    // selfplay 每次下发的局数
+	GatekeeperGames  int    // gatekeeper 对打目标局数（成对）
+	SprtElo0         float64
+	SprtElo1         float64
+	SprtAlpha        float64
+	SprtBeta         float64
+	MinClientVersion string
+	ThreadsBaseline  int // 资源分配基准线程数：games = GamesPerTask × threads/baseline（<=0 则不缩放）
+	InitialRevealed  int // 课程学习初始值：仅当库中无记录时生效（运行时以 Control 为准）
 }
 
 // extraConfig 生成 SelfPlayParams.extra_config（JSON 透传）；无课程参数时为空串。
 func (s *Server) extraConfig() string {
-	if s.cfg.InitialRevealed <= 0 {
+	n := s.ctl.InitialRevealed()
+	if n <= 0 {
 		return ""
 	}
-	return fmt.Sprintf(`{"initial_revealed_pieces":%d}`, s.cfg.InitialRevealed)
+	return fmt.Sprintf(`{"initial_revealed_pieces":%d}`, n)
 }
 
 // gamesFor 按 worker 线程数缩放本批局数（资源分配；threads<=0 视为 1）。
@@ -63,9 +65,34 @@ type runningTask struct {
 	CreatedAt   time.Time
 }
 
+// RunningTask 是进行中任务的只读快照（WebUI 展示用）。
+type RunningTask struct {
+	TaskID      string
+	WorkerID    string
+	Kind        pb.TaskKind
+	MatchID     int64
+	NetworkSha  string
+	OpponentSha string
+	Games       int
+	CreatedAt   time.Time
+}
+
+// Runtime 是调度器运行时配置快照（含 WebUI 可写项）。
+type Runtime struct {
+	Variant          string
+	MinClientVersion string
+	SprtElo0         float64
+	SprtElo1         float64
+	SprtAlpha        float64
+	SprtBeta         float64
+	Paused           bool
+	InitialRevealed  int
+}
+
 type Server struct {
 	pb.UnimplementedSchedulerServiceServer
 	cfg   Config
+	ctl   *Control
 	store *store.Store
 	r2    *r2.Presigner
 
@@ -73,8 +100,41 @@ type Server struct {
 	tasks map[string]*runningTask
 }
 
-func New(cfg Config, st *store.Store, presigner *r2.Presigner) *Server {
-	return &Server{cfg: cfg, store: st, r2: presigner, tasks: make(map[string]*runningTask)}
+func New(cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
+	ctl, err := loadControl(st, cfg.InitialRevealed)
+	if err != nil {
+		return nil, fmt.Errorf("load control: %w", err)
+	}
+	return &Server{cfg: cfg, ctl: ctl, store: st, r2: presigner, tasks: make(map[string]*runningTask)}, nil
+}
+
+func (s *Server) Control() *Control { return s.ctl }
+
+func (s *Server) Runtime() Runtime {
+	return Runtime{
+		Variant:          s.cfg.Variant,
+		MinClientVersion: s.cfg.MinClientVersion,
+		SprtElo0:         s.cfg.SprtElo0,
+		SprtElo1:         s.cfg.SprtElo1,
+		SprtAlpha:        s.cfg.SprtAlpha,
+		SprtBeta:         s.cfg.SprtBeta,
+		Paused:           s.ctl.Paused(),
+		InitialRevealed:  s.ctl.InitialRevealed(),
+	}
+}
+
+func (s *Server) RunningTasks() []RunningTask {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]RunningTask, 0, len(s.tasks))
+	for id, t := range s.tasks {
+		out = append(out, RunningTask{
+			TaskID: id, WorkerID: t.WorkerID, Kind: t.Kind, MatchID: t.MatchID,
+			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha, Games: t.Games, CreatedAt: t.CreatedAt,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out
 }
 
 func newID() string {
@@ -117,6 +177,10 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		return resp, nil
 	}
 
+	if s.ctl.Paused() {
+		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "self_play_paused"}, nil
+	}
+
 	// 常规 selfplay：拉 best 网络
 	best, err := s.store.GetBest()
 	if err != nil {
@@ -127,12 +191,12 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	}
 	taskID := newID()
 	resp := &pb.TaskResponse{
-		TaskId:            taskID,
-		Kind:              pb.TaskKind_TASK_SELFPLAY,
-		NetworkSha:        best.Sha,
-		NetworkShaRemote:  best.Sha,
-		Games:             s.gamesFor(req.Threads),
-		Params:            &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
+		TaskId:           taskID,
+		Kind:             pb.TaskKind_TASK_SELFPLAY,
+		NetworkSha:       best.Sha,
+		NetworkShaRemote: best.Sha,
+		Games:            s.gamesFor(req.Threads),
+		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
 	}
 	if req.CurrentNetwork != best.Sha {
 		url, err := s.r2.PresignGet(ctx, r2.NetworkKey(best.Sha))
@@ -359,7 +423,7 @@ func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.H
 	if err != nil {
 		return nil, err
 	}
-	reply := &pb.HeartbeatReply{}
+	reply := &pb.HeartbeatReply{PauseSelfPlay: s.ctl.Paused()}
 	if best != nil {
 		reply.BestNetwork = best.Sha
 	}

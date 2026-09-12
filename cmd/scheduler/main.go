@@ -7,7 +7,9 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"time"
 
+	"banqi/server/internal/api"
 	"banqi/server/internal/r2"
 	"banqi/server/internal/scheduler"
 	"banqi/server/internal/store"
@@ -17,33 +19,37 @@ import (
 )
 
 type config struct {
-	listen      string
-	variant     string
-	sqlitePath  string
-	r2Bucket    string
-	gamesPerTask int
-	gatekeeperGames int
-	threadsBaseline int
-	initialRevealed int
+	listen                  string
+	variant                 string
+	sqlitePath              string
+	r2Bucket                string
+	gamesPerTask            int
+	gatekeeperGames         int
+	threadsBaseline         int
+	initialRevealed         int
 	elo0, elo1, alpha, beta float64
-	minClientVersion string
+	minClientVersion        string
+	httpAddr                string
+	workerOnlineSeconds     int
 }
 
 func loadConfig() config {
 	c := config{
-		listen:          envOr("SCHEDULER_LISTEN", ":50052"),
-		variant:         envOr("SCHEDULER_VARIANT", "4x8"),
-		sqlitePath:      envOr("SCHEDULER_DB", "scheduler.db"),
-		r2Bucket:        envOr("SCHEDULER_R2_BUCKET", "banqi"),
-		gamesPerTask:    envInt("SCHEDULER_GAMES_PER_TASK", 16),
-		gatekeeperGames: envInt("SCHEDULER_GATEKEEPER_PAIRS", 400),
-		threadsBaseline: envInt("SCHEDULER_THREADS_BASELINE", 0),
-		initialRevealed: envInt("SCHEDULER_INITIAL_REVEALED", 0),
-		elo0:            envFloat("SCHEDULER_SPRT_ELO0", 0),
-		elo1:            envFloat("SCHEDULER_SPRT_ELO1", 30),
-		alpha:           envFloat("SCHEDULER_SPRT_ALPHA", 0.05),
-		beta:            envFloat("SCHEDULER_SPRT_BETA", 0.05),
-		minClientVersion: os.Getenv("SCHEDULER_MIN_CLIENT_VERSION"),
+		listen:              envOr("SCHEDULER_LISTEN", ":50052"),
+		variant:             envOr("SCHEDULER_VARIANT", "4x8"),
+		sqlitePath:          envOr("SCHEDULER_DB", "scheduler.db"),
+		r2Bucket:            envOr("SCHEDULER_R2_BUCKET", "banqi"),
+		gamesPerTask:        envInt("SCHEDULER_GAMES_PER_TASK", 16),
+		gatekeeperGames:     envInt("SCHEDULER_GATEKEEPER_PAIRS", 400),
+		threadsBaseline:     envInt("SCHEDULER_THREADS_BASELINE", 0),
+		initialRevealed:     envInt("SCHEDULER_INITIAL_REVEALED", 0),
+		elo0:                envFloat("SCHEDULER_SPRT_ELO0", 0),
+		elo1:                envFloat("SCHEDULER_SPRT_ELO1", 30),
+		alpha:               envFloat("SCHEDULER_SPRT_ALPHA", 0.05),
+		beta:                envFloat("SCHEDULER_SPRT_BETA", 0.05),
+		minClientVersion:    os.Getenv("SCHEDULER_MIN_CLIENT_VERSION"),
+		httpAddr:            envOr("SCHEDULER_HTTP_ADDR", "127.0.0.1:8080"),
+		workerOnlineSeconds: envInt("SCHEDULER_WORKER_ONLINE_SECONDS", 60),
 	}
 	return c
 }
@@ -82,7 +88,8 @@ func main() {
 		log.Println("env: SCHEDULER_LISTEN, SCHEDULER_VARIANT, SCHEDULER_DB, SCHEDULER_R2_BUCKET,",
 			"SCHEDULER_GAMES_PER_TASK, SCHEDULER_GATEKEEPER_PAIRS, SCHEDULER_THREADS_BASELINE,",
 			"SCHEDULER_INITIAL_REVEALED, SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
-			"SCHEDULER_MIN_CLIENT_VERSION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3")
+			"SCHEDULER_MIN_CLIENT_VERSION, SCHEDULER_HTTP_ADDR, SCHEDULER_WORKER_ONLINE_SECONDS,",
+			"AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3")
 		return
 	}
 	cfg := loadConfig()
@@ -99,7 +106,7 @@ func main() {
 		log.Fatalf("r2 presigner: %v", err)
 	}
 
-	srv := scheduler.New(scheduler.Config{
+	srv, err := scheduler.New(scheduler.Config{
 		Variant:          cfg.variant,
 		GamesPerTask:     cfg.gamesPerTask,
 		GatekeeperGames:  cfg.gatekeeperGames,
@@ -111,6 +118,19 @@ func main() {
 		SprtBeta:         cfg.beta,
 		MinClientVersion: cfg.minClientVersion,
 	}, st, presigner)
+	if err != nil {
+		log.Fatalf("scheduler: %v", err)
+	}
+
+	onlineWindow := time.Duration(cfg.workerOnlineSeconds) * time.Second
+	webui := api.New(st, srv, onlineWindow)
+	go func() {
+		log.Printf("[webui] listening on %s variant=%s paused=%v initial_revealed=%d",
+			cfg.httpAddr, cfg.variant, srv.Runtime().Paused, srv.Runtime().InitialRevealed)
+		if err := webui.ListenAndServe(cfg.httpAddr); err != nil {
+			log.Printf("[webui] serve stopped: %v（gRPC 调度不受影响）", err)
+		}
+	}()
 
 	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {

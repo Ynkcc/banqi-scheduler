@@ -40,6 +40,24 @@ type Episode struct {
 	CreatedAt  time.Time
 }
 
+type Worker struct {
+	ID             string
+	LastSeen       time.Time
+	Threads        int
+	CompletedGames int
+	ClientVersion  string
+	MemoryMb       int64
+}
+
+type Counts struct {
+	Networks       int `json:"networks"`
+	Candidates     int `json:"candidates"`
+	MatchesRunning int `json:"matchesRunning"`
+	Episodes       int `json:"episodes"`
+	EpisodeGames   int `json:"episodeGames"`
+	Workers        int `json:"workers"`
+}
+
 // ListEpisodeKeys 游标分页列出已登记的 episode 对象键（字典序递增）。
 // afterKey 为上次返回的最后一个键；limit<=0 时取默认 200。
 func (s *Store) ListEpisodeKeys(afterKey string, limit int) ([]string, error) {
@@ -126,6 +144,10 @@ func (s *Store) migrate() error {
 			client_version TEXT NOT NULL DEFAULT '',
 			memory_mb INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
 		// 旧库升级：workers 表补列（已存在时忽略错误）
 		`ALTER TABLE workers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE workers ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0`,
@@ -142,33 +164,38 @@ func (s *Store) migrate() error {
 	return nil
 }
 
-func (s *Store) GetBest() (*Network, error) {
+const networkColumns = `sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'')`
+
+// scanNetworkRow 统一 networks 行扫描，*sql.Row 与 *sql.Rows 通用。
+func scanNetworkRow(row interface{ Scan(...any) error }) (*Network, error) {
 	n := &Network{}
 	var createdAt int64
-	err := s.db.QueryRow(`SELECT sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'') FROM networks WHERE is_best=1 LIMIT 1`).
-		Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes)
+	if err := row.Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes); err != nil {
+		return nil, err
+	}
+	n.CreatedAt = time.Unix(createdAt, 0)
+	return n, nil
+}
+
+func (s *Store) GetBest() (*Network, error) {
+	n, err := scanNetworkRow(s.db.QueryRow(`SELECT ` + networkColumns + ` FROM networks WHERE is_best=1 LIMIT 1`))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get best network: %w", err)
 	}
-	n.CreatedAt = time.Unix(createdAt, 0)
 	return n, nil
 }
 
 func (s *Store) GetNetwork(sha string) (*Network, error) {
-	n := &Network{}
-	var createdAt int64
-	err := s.db.QueryRow(`SELECT sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'') FROM networks WHERE sha=?`, sha).
-		Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes)
+	n, err := scanNetworkRow(s.db.QueryRow(`SELECT `+networkColumns+` FROM networks WHERE sha=?`, sha))
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("get network %s: %w", sha, err)
 	}
-	n.CreatedAt = time.Unix(createdAt, 0)
 	return n, nil
 }
 
@@ -286,4 +313,138 @@ func (s *Store) WorkerVersion(id string) (string, error) {
 		return "", fmt.Errorf("worker version %s: %w", id, err)
 	}
 	return v, nil
+}
+
+// GetSetting 读取运行时设置；键不存在时返回空串。
+func (s *Store) GetSetting(key string) (string, error) {
+	var v string
+	err := s.db.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("get setting %s: %w", key, err)
+	}
+	return v, nil
+}
+
+func (s *Store) SetSetting(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO settings (key, value) VALUES (?,?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	if err != nil {
+		return fmt.Errorf("set setting %s=%s: %w", key, value, err)
+	}
+	return nil
+}
+
+func (s *Store) ListNetworks() ([]Network, error) {
+	rows, err := s.db.Query(`SELECT ` + networkColumns + ` FROM networks ORDER BY is_best DESC, created_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list networks: %w", err)
+	}
+	defer rows.Close()
+	var out []Network
+	for rows.Next() {
+		n, err := scanNetworkRow(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan network row: %w", err)
+		}
+		out = append(out, *n)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListMatches() ([]Match, error) {
+	rows, err := s.db.Query(`SELECT id, candidate, opponent, status, pair_ll, pair_ld, pair_dd, pair_dw, pair_ww, num_games, target_games
+		FROM matches ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END, id DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list matches: %w", err)
+	}
+	defer rows.Close()
+	var out []Match
+	for rows.Next() {
+		m := Match{}
+		if err := rows.Scan(&m.ID, &m.Candidate, &m.Opponent, &m.Status,
+			&m.Pairs[0], &m.Pairs[1], &m.Pairs[2], &m.Pairs[3], &m.Pairs[4],
+			&m.NumGames, &m.TargetGames); err != nil {
+			return nil, fmt.Errorf("scan match row: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) ListWorkers() ([]Worker, error) {
+	rows, err := s.db.Query(`SELECT id, last_seen, threads, completed_games, client_version, memory_mb
+		FROM workers ORDER BY last_seen DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("list workers: %w", err)
+	}
+	defer rows.Close()
+	var out []Worker
+	for rows.Next() {
+		var w Worker
+		var lastSeen int64
+		if err := rows.Scan(&w.ID, &lastSeen, &w.Threads, &w.CompletedGames, &w.ClientVersion, &w.MemoryMb); err != nil {
+			return nil, fmt.Errorf("scan worker row: %w", err)
+		}
+		w.LastSeen = time.Unix(lastSeen, 0)
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// ListEpisodes 按 id 倒序分页（beforeID<=0 表示取最新一页）。
+func (s *Store) ListEpisodes(beforeID int64, limit int) ([]Episode, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	query := `SELECT id, worker_id, task_id, network_sha, game_count, total_steps, winner, object_key, created_at FROM episodes`
+	args := []any{}
+	if beforeID > 0 {
+		query += ` WHERE id < ?`
+		args = append(args, beforeID)
+	}
+	query += ` ORDER BY id DESC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list episodes: %w", err)
+	}
+	defer rows.Close()
+	var out []Episode
+	for rows.Next() {
+		var e Episode
+		var createdAt int64
+		if err := rows.Scan(&e.ID, &e.WorkerID, &e.TaskID, &e.NetworkSha, &e.GameCount,
+			&e.TotalSteps, &e.Winner, &e.ObjectKey, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan episode row: %w", err)
+		}
+		e.CreatedAt = time.Unix(createdAt, 0)
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) Counts() (Counts, error) {
+	var c Counts
+	targets := []struct {
+		query string
+		dst   *int
+	}{
+		{`SELECT COUNT(*) FROM networks`, &c.Networks},
+		{`SELECT COUNT(*) FROM networks WHERE status='candidate'`, &c.Candidates},
+		{`SELECT COUNT(*) FROM matches WHERE status='running'`, &c.MatchesRunning},
+		{`SELECT COUNT(*) FROM episodes`, &c.Episodes},
+		{`SELECT COUNT(*) FROM workers`, &c.Workers},
+	}
+	for _, t := range targets {
+		if err := s.db.QueryRow(t.query).Scan(t.dst); err != nil {
+			return c, fmt.Errorf("counts %q: %w", t.query, err)
+		}
+	}
+	if err := s.db.QueryRow(`SELECT COALESCE(SUM(game_count),0) FROM episodes`).Scan(&c.EpisodeGames); err != nil {
+		return c, fmt.Errorf("counts episode_games: %w", err)
+	}
+	return c, nil
 }
