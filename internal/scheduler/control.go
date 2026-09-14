@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"sync"
@@ -22,14 +23,14 @@ type Control struct {
 	initialRevealed int
 }
 
-func loadControl(st *store.Store, defaultInitialRevealed int) (*Control, error) {
+func loadControl(ctx context.Context, st *store.Store, defaultInitialRevealed int) (*Control, error) {
 	c := &Control{store: st, initialRevealed: defaultInitialRevealed}
-	paused, err := st.GetSetting(settingPauseSelfPlay)
+	paused, err := st.GetSetting(ctx, settingPauseSelfPlay)
 	if err != nil {
 		return nil, err
 	}
 	c.paused = paused == "1"
-	revealed, err := st.GetSetting(settingInitialRevealed)
+	revealed, err := st.GetSetting(ctx, settingInitialRevealed)
 	if err != nil {
 		return nil, err
 	}
@@ -49,14 +50,14 @@ func (c *Control) Paused() bool {
 	return c.paused
 }
 
-func (c *Control) SetPaused(paused bool) error {
+func (c *Control) SetPaused(ctx context.Context, paused bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	value := "0"
 	if paused {
 		value = "1"
 	}
-	if err := c.store.SetSetting(settingPauseSelfPlay, value); err != nil {
+	if err := c.store.SetSetting(ctx, settingPauseSelfPlay, value); err != nil {
 		return err
 	}
 	c.paused = paused
@@ -69,13 +70,13 @@ func (c *Control) InitialRevealed() int {
 	return c.initialRevealed
 }
 
-func (c *Control) SetInitialRevealed(n int) error {
+func (c *Control) SetInitialRevealed(ctx context.Context, n int) error {
 	if n < 0 {
 		return fmt.Errorf("initial_revealed must be >= 0, got %d", n)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.store.SetSetting(settingInitialRevealed, strconv.Itoa(n)); err != nil {
+	if err := c.store.SetSetting(ctx, settingInitialRevealed, strconv.Itoa(n)); err != nil {
 		return err
 	}
 	c.initialRevealed = n

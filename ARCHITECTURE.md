@@ -15,12 +15,12 @@
 | 条目 | 说明 |
 |---|---|
 | `go.mod` | module `banqi/server` |
-| `cmd/scheduler/main.go` | 入口，配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明）。另读标准 `AWS_*` 凭据/endpoint，`AWS_S3_PATH_STYLE=1` 时改用 path-style 寻址（本地 RustFS / MinIO 必需，R2 默认不设） |
-| `internal/store` | SQLite 元数据（networks/matches/episodes/workers/settings，best 指针事务切换） |
+| `cmd/scheduler/main.go` | 入口：`run()` 编排生命周期（`signal.NotifyContext` → `GracefulStop` + WebUI `Shutdown`），配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明）。另读标准 `AWS_*` 凭据/endpoint，`AWS_S3_PATH_STYLE=1` 时改用 path-style 寻址（本地 RustFS / MinIO 必需，R2 默认不设） |
+| `internal/store` | SQLite 元数据，全部方法以 `context` 为首参；文件按表拆分：`store.go`（连接/迁移/统计/设置）、`networks.go`、`matches.go`、`episodes.go`、`workers.go`；迁移用 `pragma_table_info` 探测列存在性，best 指针事务切换 |
 | `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.jsonl.gz`、`networks/<sha>.bin` |
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
-| `internal/scheduler` | gRPC 服务实现 + 任务表（内存 task_id 注册校验）；`control.go` 为运行时控制状态（落库 settings） |
-| `internal/api` | WebUI 的 JSON API + 控制端点 + embed 前端产物（同进程 http.Server） |
+| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask）、`networks.go`（登记/晋级/gatekeeper 判停）、`episodes.go`（episode 登记与 trainer 数据面）、`control.go`（运行时控制，落库 settings） |
+| `internal/api` | WebUI 的 JSON API + 控制端点 + embed 前端产物（`HTTPServer(addr)` 交由调用方启停，同进程 http.Server） |
 | `webui/` | React 18 + Vite + TS + AntD 前端源码，构建产物输出到 `internal/api/dist` |
 | `pb/` | protoc 生成代码（不提交） |
 | `proto/scheduler.proto` | 契约源文件（已随拆分迁入；主仓库 `build.rs` 仍编译自己的 `proto/scheduler.proto` 副本，proto 变更需双侧同步） |
@@ -75,7 +75,7 @@ go build ./cmd/scheduler
 | `POST /api/networks/{sha}/promote` | 手动晋级 best |
 | `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发 |
 
-已知限制：`scheduler.Server.tasks` 只做 task↔worker 归属校验、从不清理，长期运行会缓慢增长（`/api/tasks` 一并展示该内存表）。
+内存任务表保留策略（见 `internal/scheduler/server.go`）：tasks 仅用于 task↔worker 归属校验与 rating 在飞判定，进度以 DB 为准；已上报结束（`Done`）的记录保留 `doneTaskRetention`(30m)、未上报记录最多保留 `taskMaxRetention`(24h)，由 `pruneTasks` 在 `GetTask` 路径上按 `pruneInterval`(1m) 节流回收；`/api/tasks` 只展示未结束任务。
 
 ## 6. 变更记录
 
@@ -85,3 +85,5 @@ go build ./cmd/scheduler
 - 2026-09-12：新增 WebUI：`internal/api`（同进程 HTTP JSON API + 控制端点 + embed 前端产物，`SCHEDULER_HTTP_ADDR`/`SCHEDULER_WORKER_ONLINE_SECONDS`）、`webui/`（React 18 + Vite + TS + AntD SPA）；`store` 新增 `settings` 表与只读列表/统计查询；`scheduler` 新增运行时 `Control`（暂停 selfplay、课程阶段切换，落库并优先于环境变量，`New` 改为返回 error），proto 无变更。
 - 2026-09-14：修正 `ListEpisodes` 游标语义——原按 `object_key` 字典序推进，而对象键含随机段（`episodes/<sha>/<random>.jsonl.gz`），字典序与登记顺序无关，会导致已登记但键更小的 episode 永久不出现在列表里（trainer 静默丢数据）。改为以 `afterKey` 反查 `episodes.id` 后按 id 递增返回，并补 `idx_episodes_object_key`；proto 与客户端无需变更。
 - 2026-09-14：`internal/r2` 新增 `AWS_S3_PATH_STYLE`（默认关闭）以支持 RustFS / MinIO 等无法 virtual-host 寻址的本地 S3 实现；启动时打印 `path_style` 便于排查。R2 侧行为不变。
+- 2026-09-15：运行时健壮性改造：①`cmd/scheduler/main.go` 改为 `run()` + `signal.NotifyContext`，收到 SIGINT/SIGTERM 后 `grpcServer.GracefulStop()` 并 `Shutdown` WebUI，启动失败路径不再被 `log.Fatalf` 跳过 defer；②内存任务表新增超期回收（`pruneTasks`，`Done` 保留 30m / 未上报最多 24h，`pruneInterval` 节流），`/api/tasks` 不再展示已结束任务；③`internal/store` 全部方法改为 ctx 首参（`QueryContext`/`ExecContext`/`BeginTx`），调用方传请求 ctx；④建表迁移改用 `pragma_table_info` 探测列存在性（删除依赖驱动错误文案的 `duplicate column name` 匹配与 `q[:40]` 切片），`RowsAffected` 错误不再被忽略；⑤`newID` 由 panic 改为返回错误；⑥gRPC 层错误补上下文（`fmt.Errorf("...: %w")`）；⑦`internal/api` 的 `ListenAndServe` 改为 `HTTPServer(addr)`，生命周期交由 `cmd/scheduler` 编排。新增 `internal/store/store_test.go`、`internal/scheduler/server_test.go`。
+- 2026-09-15：文件拆分（降低单文件认知负荷）：`internal/store/store.go`(455 行) 拆为 `store.go` / `networks.go` / `matches.go` / `episodes.go` / `workers.go`（并抽出 `matchColumns` 统一列序）；`internal/scheduler/server.go`(495→544 行) 拆为 `server.go` / `tasks.go` / `networks.go` / `episodes.go`（新增 `lookupTask` / `markTaskDone` / `registerTask` / `judgeMatch` 辅助），单文件均 < 250 行。新增 `internal/api/handlers_test.go`（status/tasks/promote/control 与错误码）。`internal/sprt/sprt.go` 补 gofmt。

@@ -1,18 +1,21 @@
+// Package scheduler 实现 gRPC 调度器：任务分发、网络登记与晋级、episode 元数据登记。
+//
+// 文件划分：
+//   - server.go    运行状态与生命周期（Server / Runtime / 内存任务表回收 / 全局状态 RPC）
+//   - tasks.go     任务下发（GetTask / ratingTask）
+//   - networks.go  网络登记与 gatekeeper 判停（GetNetwork / RegisterNetwork / ReportMatchResult）
+//   - episodes.go  episode 登记与 trainer 数据面（ReportEpisode / SignNetworkUpload / ListEpisodes）
 package scheduler
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"log"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
 	"banqi/server/internal/r2"
-	"banqi/server/internal/sprt"
 	"banqi/server/internal/store"
 	pb "banqi/server/pb"
 )
@@ -63,10 +66,22 @@ type runningTask struct {
 	Games       int
 	WorkerID    string
 	CreatedAt   time.Time
-	// Done 标记任务已上报结束（rating 用）：tasks 表从不清理，
-	// 靠该标记释放 match 的在飞名额。
+	// Done 标记任务已上报结束（rating 用）：Done 后即释放 match 的在飞名额。
 	Done bool
 }
+
+// 内存任务表（tasks）保留策略。tasks 仅用于 task↔worker 归属校验与在飞判定，
+// 进度以 DB 为准，因此超期记录可安全回收，避免长期运行内存无限增长。
+const (
+	// ratingTaskStaleAfter：rating 任务超过该时长未上报即视为失效（worker 掉线）。
+	ratingTaskStaleAfter = 10 * time.Minute
+	// doneTaskRetention：已上报结束的任务记录保留时长（保留一小段，便于重复上报得到明确错误）。
+	doneTaskRetention = 30 * time.Minute
+	// taskMaxRetention：未上报任务记录的最大保留时长（正常批次远短于此）。
+	taskMaxRetention = 24 * time.Hour
+	// pruneInterval：回收扫描的最小间隔（节流，避免每次请求都全表扫描）。
+	pruneInterval = time.Minute
+)
 
 // ratingInFlight 判断某 match 是否已有 rating 任务在飞。
 // 同一 match 被多个 worker 并发领取会导致重复上报（后到者必被
@@ -84,8 +99,27 @@ func (s *Server) ratingInFlight(matchID int64) bool {
 	return false
 }
 
-// ratingTaskStaleAfter：rating 任务超过该时长未上报即视为失效（worker 掉线）。
-const ratingTaskStaleAfter = 10 * time.Minute
+// pruneTasks 回收内存任务表中的超期记录；now 由调用方传入以便测试。
+// 内部按 pruneInterval 节流，可在请求路径上安全高频调用。
+func (s *Server) pruneTasks(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.lastPrune.IsZero() && now.Sub(s.lastPrune) < pruneInterval {
+		return
+	}
+	s.lastPrune = now
+	removed := 0
+	for id, t := range s.tasks {
+		age := now.Sub(t.CreatedAt)
+		if (t.Done && age >= doneTaskRetention) || age >= taskMaxRetention {
+			delete(s.tasks, id)
+			removed++
+		}
+	}
+	if removed > 0 {
+		log.Printf("[task] 回收超期任务记录 %d 条，内存表剩余 %d 条", removed, len(s.tasks))
+	}
+}
 
 // RunningTask 是进行中任务的只读快照（WebUI 展示用）。
 type RunningTask struct {
@@ -118,12 +152,13 @@ type Server struct {
 	store *store.Store
 	r2    *r2.Presigner
 
-	mu    sync.Mutex
-	tasks map[string]*runningTask
+	mu        sync.Mutex
+	tasks     map[string]*runningTask
+	lastPrune time.Time
 }
 
-func New(cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
-	ctl, err := loadControl(st, cfg.InitialRevealed)
+func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
+	ctl, err := loadControl(ctx, st, cfg.InitialRevealed)
 	if err != nil {
 		return nil, fmt.Errorf("load control: %w", err)
 	}
@@ -150,6 +185,9 @@ func (s *Server) RunningTasks() []RunningTask {
 	defer s.mu.Unlock()
 	out := make([]RunningTask, 0, len(s.tasks))
 	for id, t := range s.tasks {
+		if t.Done {
+			continue // 已上报结束的任务不再展示为「进行中」
+		}
 		out = append(out, RunningTask{
 			TaskID: id, WorkerID: t.WorkerID, Kind: t.Kind, MatchID: t.MatchID,
 			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha, Games: t.Games, CreatedAt: t.CreatedAt,
@@ -159,12 +197,21 @@ func (s *Server) RunningTasks() []RunningTask {
 	return out
 }
 
-func newID() string {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		panic(fmt.Errorf("generate random id: %w", err))
+// lookupTask 读取任务记录（字段在写入后不可变，返回值可安全在锁外读取）。
+func (s *Server) lookupTask(taskID string) (*runningTask, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	return t, ok
+}
+
+// markTaskDone 标记任务已上报结束（释放 rating 的在飞名额）。
+func (s *Server) markTaskDone(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.tasks[taskID]; ok {
+		t.Done = true
 	}
-	return hex.EncodeToString(b)
 }
 
 // GetInfo 下发调度器全局信息（trainer 启动时获取变体，worker 零配置）。
@@ -172,324 +219,24 @@ func (s *Server) GetInfo(ctx context.Context, req *pb.GetInfoRequest) (*pb.GetIn
 	return &pb.GetInfoReply{Variant: s.cfg.Variant}, nil
 }
 
-func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error) {
-	if s.cfg.MinClientVersion != "" && req.ClientVersion != "" && req.ClientVersion < s.cfg.MinClientVersion {
-		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "client_version_too_old"}, nil
-	}
-	if req.ClientVersion != "" {
-		log.Printf("[task] worker=%s version=%s threads=%d memory_mb=%d", req.WorkerId, req.ClientVersion, req.Threads, req.MemoryMb)
-	}
-
-	// 优先下发未完结的 gatekeeper 对打（lczero target_slice 模式）
-	m, err := s.store.PendingMatch()
-	if err != nil {
-		return nil, err
-	}
-	if m != nil && !s.ratingInFlight(m.ID) {
-		taskID := newID()
-		resp, err := s.ratingTask(ctx, taskID, m, req)
-		if err != nil {
-			return nil, err
-		}
-		s.mu.Lock()
-		s.tasks[taskID] = &runningTask{Kind: pb.TaskKind_TASK_RATING, MatchID: m.ID,
-			NetworkSha: m.Candidate, OpponentSha: m.Opponent, Games: int(resp.Games), WorkerID: req.WorkerId, CreatedAt: time.Now()}
-		s.mu.Unlock()
-		log.Printf("[task] rating assigned worker=%s match=%d candidate=%s opponent=%s", req.WorkerId, m.ID, m.Candidate, m.Opponent)
-		return resp, nil
-	}
-
-	if s.ctl.Paused() {
-		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "self_play_paused"}, nil
-	}
-
-	// 常规 selfplay：拉 best 网络
-	best, err := s.store.GetBest()
-	if err != nil {
-		return nil, err
-	}
-	if best == nil {
-		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "no_best_network_registered"}, nil
-	}
-	taskID := newID()
-	resp := &pb.TaskResponse{
-		TaskId:           taskID,
-		Kind:             pb.TaskKind_TASK_SELFPLAY,
-		NetworkSha:       best.Sha,
-		NetworkShaRemote: best.Sha,
-		Games:            s.gamesFor(req.Threads),
-		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
-	}
-	if req.CurrentNetwork != best.Sha {
-		url, err := s.r2.PresignGet(ctx, r2.NetworkKey(best.Sha))
-		if err != nil {
-			return nil, err
-		}
-		resp.NetworkUrl = url
-	}
-	s.mu.Lock()
-	s.tasks[taskID] = &runningTask{Kind: pb.TaskKind_TASK_SELFPLAY, NetworkSha: best.Sha, Games: int(resp.Games), WorkerID: req.WorkerId, CreatedAt: time.Now()}
-	s.mu.Unlock()
-	log.Printf("[task] selfplay assigned worker=%s task=%s network=%s games=%d", req.WorkerId, taskID, best.Sha, resp.Games)
-	return resp, nil
-}
-
-func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, req *pb.TaskRequest) (*pb.TaskResponse, error) {
-	remaining := m.TargetGames*2 - m.NumGames
-	if remaining <= 0 {
-		remaining = 2
-	}
-	games := remaining
-	if scaled := s.gamesFor(req.Threads); int(scaled) < games {
-		games = int(scaled)
-	}
-	resp := &pb.TaskResponse{
-		TaskId:           taskID,
-		Kind:             pb.TaskKind_TASK_RATING,
-		NetworkSha:       m.Candidate,
-		OpponentSha:      m.Opponent,
-		NetworkShaRemote: m.Candidate,
-		Games:            int32(games),
-		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
-	}
-	candidateURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Candidate))
-	if err != nil {
-		return nil, err
-	}
-	opponentURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Opponent))
-	if err != nil {
-		return nil, err
-	}
-	resp.NetworkUrl = candidateURL
-	resp.OpponentUrl = opponentURL
-	return resp, nil
-}
-
-func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.EpisodeAck, error) {
-	s.mu.Lock()
-	task, ok := s.tasks[req.TaskId]
-	s.mu.Unlock()
-	if !ok {
-		return &pb.EpisodeAck{Accepted: false, Message: "unknown_task_id:" + req.TaskId}, nil
-	}
-	if task.WorkerID != req.WorkerId {
-		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
-	}
-	if task.NetworkSha != req.NetworkSha {
-		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("network_sha_mismatch task=%s got=%s", task.NetworkSha, req.NetworkSha)}, nil
-	}
-	key := r2.EpisodeKey(req.NetworkSha, newID())
-	url, err := s.r2.PresignPut(ctx, key, req.ContentLength)
-	if err != nil {
-		return nil, err
-	}
-	if err := s.store.InsertEpisode(store.Episode{
-		WorkerID: req.WorkerId, TaskID: req.TaskId, NetworkSha: req.NetworkSha,
-		GameCount: int(req.GameCount), TotalSteps: int(req.TotalSteps), Winner: int(req.Winner), ObjectKey: key,
-	}); err != nil {
-		return nil, err
-	}
-	log.Printf("[episode] worker=%s task=%s network=%s games=%d steps=%d -> %s",
-		req.WorkerId, req.TaskId, req.NetworkSha, req.GameCount, req.TotalSteps, key)
-	return &pb.EpisodeAck{Accepted: true, UploadUrl: url, ObjectKey: key}, nil
-}
-
-func (s *Server) GetNetwork(ctx context.Context, req *pb.NetworkRequest) (*pb.NetworkInfo, error) {
-	var n *store.Network
-	var err error
-	if req.Sha == "" {
-		n, err = s.store.GetBest()
-	} else {
-		n, err = s.store.GetNetwork(req.Sha)
-	}
-	if err != nil {
-		return nil, err
-	}
-	if n == nil {
-		return nil, fmt.Errorf("network not found sha=%q", req.Sha)
-	}
-	url, err := s.r2.PresignGet(ctx, r2.NetworkKey(n.Sha))
-	if err != nil {
-		return nil, err
-	}
-	return &pb.NetworkInfo{
-		Sha: n.Sha, DownloadUrl: url, CreatedAt: n.CreatedAt.Unix(), IsBest: n.IsBest,
-		GameData: fmt.Sprintf(`{"parent_sha":%q}`, n.ParentSha),
-	}, nil
-}
-
-func (s *Server) RegisterNetwork(ctx context.Context, req *pb.RegisterNetworkRequest) (*pb.RegisterNetworkAck, error) {
-	best, err := s.store.GetBest()
-	if err != nil {
-		return nil, err
-	}
-	if best != nil && best.Sha == req.Sha {
-		return &pb.RegisterNetworkAck{Accepted: false, Message: "sha_equals_current_best"}, nil
-	}
-	created, err := s.store.RegisterNetwork(req.Sha, req.ParentSha, req.Notes)
-	if err != nil {
-		return nil, err
-	}
-	if !created {
-		return &pb.RegisterNetworkAck{Accepted: false, Message: "duplicate_sha:" + req.Sha}, nil
-	}
-	if best == nil {
-		// 首个网络直接晋级
-		if err := s.store.PromoteBest(req.Sha); err != nil {
-			return nil, err
-		}
-		log.Printf("[network] first network promoted sha=%s", req.Sha)
-		return &pb.RegisterNetworkAck{Accepted: true, Message: "first_network_promoted"}, nil
-	}
-	matchID, err := s.store.CreateMatch(req.Sha, best.Sha, s.cfg.GatekeeperGames)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[gatekeeper] match=%d created candidate=%s vs best=%s target_pairs=%d",
-		matchID, req.Sha, best.Sha, s.cfg.GatekeeperGames)
-	return &pb.RegisterNetworkAck{Accepted: true, MatchTaskHint: fmt.Sprintf("gatekeeper match %d vs %s", matchID, best.Sha)}, nil
-}
-
-func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*pb.MatchResultAck, error) {
-	s.mu.Lock()
-	task, ok := s.tasks[req.TaskId]
-	s.mu.Unlock()
-	if !ok {
-		return &pb.MatchResultAck{Accepted: false, Message: "unknown_task_id:" + req.TaskId}, nil
-	}
-	if task.WorkerID != req.WorkerId {
-		return &pb.MatchResultAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
-	}
-	if task.Kind != pb.TaskKind_TASK_RATING {
-		return &pb.MatchResultAck{Accepted: false, Message: "task_is_not_rating"}, nil
-	}
-	// 任务已上报完毕：置 Done 释放 match 的在飞名额（无论本次是否被接受，
-	// 重复上报同样应释放，避免 match 卡死）
-	s.mu.Lock()
-	if t, ok := s.tasks[req.TaskId]; ok {
-		t.Done = true
-	}
-	s.mu.Unlock()
-	m, err := s.store.GetMatch(task.MatchID)
-	if err != nil {
-		return nil, err
-	}
-	if m == nil || m.Status != "running" {
-		return &pb.MatchResultAck{Accepted: false, Message: fmt.Sprintf("match_%d_not_running", task.MatchID)}, nil
-	}
-
-	pairs := m.Pairs
-	pairs[0] += int(req.PairLl)
-	pairs[1] += int(req.PairLd)
-	pairs[2] += int(req.PairDd)
-	pairs[3] += int(req.PairDw)
-	pairs[4] += int(req.PairWw)
-	numGames := m.NumGames + int(req.Games)
-
-	verdict := sprt.Continue
-	var llr float64
-	if numGames >= m.TargetGames*2 || sprt.Pentanomial(pairs).Total() >= m.TargetGames {
-		p := sprt.Pentanomial(pairs)
-		bounds := sprt.NewBounds(s.cfg.SprtAlpha, s.cfg.SprtBeta)
-		verdict, llr, err = sprt.Judge(p, s.cfg.SprtElo0, s.cfg.SprtElo1, bounds)
-		if err != nil {
-			return nil, err
-		}
-		if verdict == sprt.Continue && numGames >= m.TargetGames*2 {
-			// 打满目标局数仍无结论：按 LLR 符号判定，LLR>0 视为达标
-			if llr > 0 {
-				verdict = sprt.AcceptH1
-			} else {
-				verdict = sprt.RejectH0
-			}
-			log.Printf("[gatekeeper] match=%d exhausted target_games=%d llr=%.3f forced verdict=%s", m.ID, m.TargetGames, llr, verdict)
-		}
-	}
-
-	status := "running"
-	promoted := false
-	best, err := s.store.GetBest()
-	if err != nil {
-		return nil, err
-	}
-	bestSha := ""
-	if best != nil {
-		bestSha = best.Sha
-	}
-	if verdict == sprt.AcceptH1 {
-		status = "concluded"
-		if err := s.store.PromoteBest(m.Candidate); err != nil {
-			return nil, err
-		}
-		promoted = true
-		bestSha = m.Candidate
-	} else if verdict == sprt.RejectH0 {
-		status = "concluded"
-		if err := s.store.UpdateNetworkStatus(m.Candidate, "rejected"); err != nil {
-			return nil, err
-		}
-	}
-	if err := s.store.UpdateMatchResult(m.ID, pairs, numGames, status); err != nil {
-		return nil, err
-	}
-	if verdict != sprt.Continue {
-		log.Printf("[gatekeeper] match=%d concluded verdict=%s llr=%.3f pairs=%v promoted=%v", m.ID, verdict, llr, pairs, promoted)
-	}
-	return &pb.MatchResultAck{Accepted: true, MatchConcluded: verdict != sprt.Continue, Promoted: promoted, BestSha: bestSha}, nil
-}
-
+// Heartbeat 记录 worker 状态并回传 best 网络与暂停标志。
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatReply, error) {
-	if err := s.store.TouchWorker(req.WorkerId, int(req.CurrentThreads), int(req.CompletedGames),
+	if err := s.store.TouchWorker(ctx, req.WorkerId, int(req.CurrentThreads), int(req.CompletedGames),
 		req.ClientVersion, req.MemoryMb); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("touch worker %s: %w", req.WorkerId, err)
 	}
 	if req.ClientVersion != "" {
-		if v, err := s.store.WorkerVersion(req.WorkerId); err == nil && v != "" && v != req.ClientVersion {
+		if v, err := s.store.WorkerVersion(ctx, req.WorkerId); err == nil && v != "" && v != req.ClientVersion {
 			log.Printf("[worker] %s version changed %s -> %s", req.WorkerId, v, req.ClientVersion)
 		}
 	}
-	best, err := s.store.GetBest()
+	best, err := s.store.GetBest(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("get best network: %w", err)
 	}
 	reply := &pb.HeartbeatReply{PauseSelfPlay: s.ctl.Paused()}
 	if best != nil {
 		reply.BestNetwork = best.Sha
 	}
-	return reply, nil
-}
-
-// SignNetworkUpload 为 trainer 签发网络直传 R2 的预签名 PUT。
-// R2 凭据只在调度器持有：对象键由 sha 决定（networks/<sha>.bin），trainer 零存储配置。
-func (s *Server) SignNetworkUpload(ctx context.Context, req *pb.SignNetworkUploadRequest) (*pb.SignNetworkUploadAck, error) {
-	sha := strings.TrimSpace(req.Sha)
-	if len(sha) != 64 {
-		return &pb.SignNetworkUploadAck{Accepted: false,
-			Message: fmt.Sprintf("invalid_sha_len=%d (want 64 hex chars)", len(sha))}, nil
-	}
-	key := r2.NetworkKey(sha)
-	url, err := s.r2.PresignPut(ctx, key, req.ContentLength)
-	if err != nil {
-		return nil, err
-	}
-	log.Printf("[network] sign upload trainer=%s sha=%s len=%d", req.TrainerId, sha, req.ContentLength)
-	return &pb.SignNetworkUploadAck{Accepted: true, UploadUrl: url, ObjectKey: key}, nil
-}
-
-// ListEpisodes 游标分页下发已登记 episode 的预签名 GET 列表（trainer 消费端）。
-func (s *Server) ListEpisodes(ctx context.Context, req *pb.ListEpisodesRequest) (*pb.ListEpisodesReply, error) {
-	keys, err := s.store.ListEpisodeKeys(req.AfterKey, int(req.Limit))
-	if err != nil {
-		return nil, err
-	}
-	reply := &pb.ListEpisodesReply{}
-	for _, k := range keys {
-		url, err := s.r2.PresignGet(ctx, k)
-		if err != nil {
-			return nil, err
-		}
-		reply.Objects = append(reply.Objects, &pb.EpisodeObject{ObjectKey: k, DownloadUrl: url})
-	}
-	reply.HasMore = len(keys) == int(req.Limit) && req.Limit > 0
 	return reply, nil
 }

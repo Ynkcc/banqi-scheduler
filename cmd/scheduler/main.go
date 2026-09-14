@@ -2,11 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"banqi/server/internal/api"
@@ -82,6 +87,17 @@ func envFloat(key string, def float64) float64 {
 }
 
 func main() {
+	if err := run(); err != nil {
+		log.Fatalf("scheduler: %v", err)
+	}
+}
+
+// shutdownGrace：优雅关闭时等待在飞请求与日志刷盘的上限。
+const shutdownGrace = 5 * time.Second
+
+// run 编排调度器生命周期：启动失败即返回错误（defer 生效后才退出），
+// 收到 SIGINT/SIGTERM 后按 gRPC → WebUI 顺序优雅关闭。
+func run() error {
 	showHelp := flag.Bool("h", false, "show environment variable help")
 	flag.Parse()
 	if *showHelp {
@@ -90,23 +106,25 @@ func main() {
 			"SCHEDULER_INITIAL_REVEALED, SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
 			"SCHEDULER_MIN_CLIENT_VERSION, SCHEDULER_HTTP_ADDR, SCHEDULER_WORKER_ONLINE_SECONDS,",
 			"AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_S3_PATH_STYLE")
-		return
+		return nil
 	}
 	cfg := loadConfig()
 
 	st, err := store.Open(cfg.sqlitePath)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		return fmt.Errorf("store: %w", err)
 	}
 	defer st.Close()
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	presigner, err := r2.New(ctx, cfg.r2Bucket)
 	if err != nil {
-		log.Fatalf("r2 presigner: %v", err)
+		return fmt.Errorf("r2 presigner: %w", err)
 	}
 
-	srv, err := scheduler.New(scheduler.Config{
+	srv, err := scheduler.New(ctx, scheduler.Config{
 		Variant:          cfg.variant,
 		GamesPerTask:     cfg.gamesPerTask,
 		GatekeeperGames:  cfg.gatekeeperGames,
@@ -119,28 +137,45 @@ func main() {
 		MinClientVersion: cfg.minClientVersion,
 	}, st, presigner)
 	if err != nil {
-		log.Fatalf("scheduler: %v", err)
+		return fmt.Errorf("scheduler: %w", err)
 	}
 
-	onlineWindow := time.Duration(cfg.workerOnlineSeconds) * time.Second
-	webui := api.New(st, srv, onlineWindow)
+	// WebUI 与 gRPC 同进程：监听失败只记日志，不影响 gRPC 调度。
+	webui := api.New(st, srv, time.Duration(cfg.workerOnlineSeconds)*time.Second)
+	webuiSrv := webui.HTTPServer(cfg.httpAddr)
 	go func() {
 		log.Printf("[webui] listening on %s variant=%s paused=%v initial_revealed=%d",
 			cfg.httpAddr, cfg.variant, srv.Runtime().Paused, srv.Runtime().InitialRevealed)
-		if err := webui.ListenAndServe(cfg.httpAddr); err != nil {
+		if err := webuiSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("[webui] serve stopped: %v（gRPC 调度不受影响）", err)
 		}
 	}()
 
 	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
-		log.Fatalf("listen %s: %v", cfg.listen, err)
+		return fmt.Errorf("listen %s: %w", cfg.listen, err)
 	}
 	grpcServer := grpc.NewServer()
 	pb.RegisterSchedulerServiceServer(grpcServer, srv)
 	log.Printf("[scheduler] listening on %s db=%s bucket=%s sprt(elo0=%g,elo1=%g,alpha=%g,beta=%g)",
 		cfg.listen, cfg.sqlitePath, cfg.r2Bucket, cfg.elo0, cfg.elo1, cfg.alpha, cfg.beta)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatalf("serve: %v", err)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- grpcServer.Serve(lis) }()
+
+	select {
+	case err := <-serveErr:
+		return fmt.Errorf("grpc serve: %w", err)
+	case <-ctx.Done():
+		log.Printf("[scheduler] 收到退出信号，开始优雅关闭")
 	}
+
+	grpcServer.GracefulStop()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	if err := webuiSrv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[webui] shutdown: %v", err)
+	}
+	log.Printf("[scheduler] 已退出")
+	return nil
 }

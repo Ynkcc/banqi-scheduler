@@ -44,9 +44,10 @@ func New(st *store.Store, sched *scheduler.Server, onlineWindow time.Duration) *
 
 func (s *Server) Handler() http.Handler { return s.handler }
 
-func (s *Server) ListenAndServe(addr string) error {
-	srv := &http.Server{Addr: addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second}
-	return srv.ListenAndServe()
+// HTTPServer 返回绑定本 Server 路由的 http.Server；由调用方负责 ListenAndServe 与 Shutdown，
+// 避免在包内持有生命周期状态（进程退出时的优雅关闭由 cmd/scheduler 统一编排）。
+func (s *Server) HTTPServer(addr string) *http.Server {
+	return &http.Server{Addr: addr, Handler: s.handler, ReadHeaderTimeout: 5 * time.Second}
 }
 
 // handleStatic 从 embed 产物里取文件；未命中的非 /api 路径回落到 index.html（前端路由）。

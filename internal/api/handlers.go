@@ -114,12 +114,12 @@ func toNetworkView(n store.Network) networkView {
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	best, err := s.store.GetBest()
+	best, err := s.store.GetBest(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	counts, err := s.store.Counts()
+	counts, err := s.store.Counts(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -141,7 +141,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.ListNetworks()
+	items, err := s.store.ListNetworks(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -155,7 +155,7 @@ func (s *Server) handleNetworks(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 	sha := r.PathValue("sha")
-	n, err := s.store.GetNetwork(sha)
+	n, err := s.store.GetNetwork(r.Context(), sha)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -168,7 +168,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "already best: "+sha)
 		return
 	}
-	if err := s.store.PromoteBest(sha); err != nil {
+	if err := s.store.PromoteBest(r.Context(), sha); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -177,7 +177,7 @@ func (s *Server) handlePromote(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.ListMatches()
+	items, err := s.store.ListMatches(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -212,7 +212,7 @@ func (s *Server) handleMatches(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
-	items, err := s.store.ListWorkers()
+	items, err := s.store.ListWorkers(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -238,7 +238,7 @@ func (s *Server) handleEpisodes(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > maxEpisodeLimit {
 		limit = defaultEpisodeLimit
 	}
-	items, err := s.store.ListEpisodes(before, limit)
+	items, err := s.store.ListEpisodes(r.Context(), before, limit)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -277,14 +277,14 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Paused != nil {
-		if err := s.sched.Control().SetPaused(*req.Paused); err != nil {
+		if err := s.sched.Control().SetPaused(r.Context(), *req.Paused); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		log.Printf("[webui] pause_self_play=%v", *req.Paused)
 	}
 	if req.InitialRevealed != nil {
-		if err := s.sched.Control().SetInitialRevealed(*req.InitialRevealed); err != nil {
+		if err := s.sched.Control().SetInitialRevealed(r.Context(), *req.InitialRevealed); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

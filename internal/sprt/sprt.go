@@ -42,7 +42,9 @@ func scoreFromElo(elo float64) float64 {
 }
 
 // LLR 基于正态近似的广义 SPRT：
-//   LLR ≈ N * (s - (s0+s1)/2) * (s1-s0) / σ²
+//
+//	LLR ≈ N * (s - (s0+s1)/2) * (s1-s0) / σ²
+//
 // s 为每局平均得分，σ² 为每局得分方差，s0/s1 由 elo0/elo1 边界换算。
 func LLR(p Pentanomial, elo0, elo1 float64) (float64, error) {
 	s, variance, err := p.Stats()
@@ -76,8 +78,8 @@ type Verdict int
 
 const (
 	Continue Verdict = iota
-	AcceptH1 // 新网络变强，晋级
-	RejectH0 // 新网络未达标，拒绝
+	AcceptH1         // 新网络变强，晋级
+	RejectH0         // 新网络未达标，拒绝
 )
 
 func (v Verdict) String() string {
