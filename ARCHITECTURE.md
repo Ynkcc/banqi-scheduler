@@ -15,7 +15,7 @@
 | 条目 | 说明 |
 |---|---|
 | `go.mod` | module `banqi/server` |
-| `cmd/scheduler/main.go` | 入口，配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明） |
+| `cmd/scheduler/main.go` | 入口，配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明）。另读标准 `AWS_*` 凭据/endpoint，`AWS_S3_PATH_STYLE=1` 时改用 path-style 寻址（本地 RustFS / MinIO 必需，R2 默认不设） |
 | `internal/store` | SQLite 元数据（networks/matches/episodes/workers/settings，best 指针事务切换） |
 | `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.jsonl.gz`、`networks/<sha>.bin` |
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
@@ -34,7 +34,7 @@
 - `ReportMatchResult`：五项成对计数累计 → GSPRT 判停 → 晋级/拒绝 best 指针；
 - `Heartbeat`：worker 状态（client_version/memory_mb/running_task_id）+ best sha 下发；
 - `SignNetworkUpload`：trainer 请求网络直传预签名 PUT；
-- `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表；
+- `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；
 - `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）。
 
 **安全约定**：R2 凭据只在调度器持有，worker/trainer 零存储配置，全部经预签名 URL 上下行。
@@ -83,3 +83,5 @@ go build ./cmd/scheduler
 - 2026-09-11：经 `git subtree split` 自主仓库 `server/` 拆出为独立仓库（保留完整提交历史）；`proto/scheduler.proto` 迁入本仓库。
 - 2026-09-11：新增 `SCHEDULER_INITIAL_REVEALED`（课程学习初始翻子数），经 `SelfPlayParams.extra_config` 下发（selfplay + rating 均生效），proto 无变更。
 - 2026-09-12：新增 WebUI：`internal/api`（同进程 HTTP JSON API + 控制端点 + embed 前端产物，`SCHEDULER_HTTP_ADDR`/`SCHEDULER_WORKER_ONLINE_SECONDS`）、`webui/`（React 18 + Vite + TS + AntD SPA）；`store` 新增 `settings` 表与只读列表/统计查询；`scheduler` 新增运行时 `Control`（暂停 selfplay、课程阶段切换，落库并优先于环境变量，`New` 改为返回 error），proto 无变更。
+- 2026-09-14：修正 `ListEpisodes` 游标语义——原按 `object_key` 字典序推进，而对象键含随机段（`episodes/<sha>/<random>.jsonl.gz`），字典序与登记顺序无关，会导致已登记但键更小的 episode 永久不出现在列表里（trainer 静默丢数据）。改为以 `afterKey` 反查 `episodes.id` 后按 id 递增返回，并补 `idx_episodes_object_key`；proto 与客户端无需变更。
+- 2026-09-14：`internal/r2` 新增 `AWS_S3_PATH_STYLE`（默认关闭）以支持 RustFS / MinIO 等无法 virtual-host 寻址的本地 S3 实现；启动时打印 `path_style` 便于排查。R2 侧行为不变。

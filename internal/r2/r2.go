@@ -3,7 +3,11 @@ package r2
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -12,8 +16,8 @@ import (
 )
 
 type Presigner struct {
-	client  *s3.Client
-	bucket  string
+	client    *s3.Client
+	bucket    string
 	publicTTL time.Duration
 }
 
@@ -27,11 +31,30 @@ func New(ctx context.Context, bucket string) (*Presigner, error) {
 	if cfg.Region == "" {
 		cfg.Region = "auto"
 	}
+	// RustFS / MinIO 等本地 S3 实现无法用 virtual-host 寻址（bucket.<host> 无法解析），
+	// 需显式开启 path style；R2 默认沿用 virtual-host，不设此变量即行为不变。
+	pathStyle := envBool("AWS_S3_PATH_STYLE", false)
+	log.Printf("[r2] bucket=%s path_style=%v", bucket, pathStyle)
 	return &Presigner{
-		client:    s3.NewFromConfig(cfg),
+		client: s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.UsePathStyle = pathStyle
+		}),
 		bucket:    bucket,
 		publicTTL: 1 * time.Hour,
 	}, nil
+}
+
+func envBool(name string, def bool) bool {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return def
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		log.Printf("[r2] %s=%q 无法解析为布尔值，按默认值 %v 处理", name, v, def)
+		return def
+	}
+	return b
 }
 
 // PresignPut 签发直传 URL。

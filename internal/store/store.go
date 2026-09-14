@@ -58,14 +58,18 @@ type Counts struct {
 	Workers        int `json:"workers"`
 }
 
-// ListEpisodeKeys 游标分页列出已登记的 episode 对象键（字典序递增）。
-// afterKey 为上次返回的最后一个键；limit<=0 时取默认 200。
+// ListEpisodeKeys 游标分页列出已登记的 episode 对象键（按登记顺序递增）。
+// afterKey 为上次返回的最后一个键，服务端据此解析出该行的 id 再按 id 推进：
+// 对象键含随机段，字典序与登记顺序无关，用字典序做游标会永久漏掉后写入的对象。
+// limit<=0 时取默认 200。
 func (s *Store) ListEpisodeKeys(afterKey string, limit int) ([]string, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
 	rows, err := s.db.Query(
-		`SELECT object_key FROM episodes WHERE object_key > ? ORDER BY object_key ASC LIMIT ?`,
+		`SELECT object_key FROM episodes
+		 WHERE id > COALESCE((SELECT id FROM episodes WHERE object_key = ?), 0)
+		 ORDER BY id ASC LIMIT ?`,
 		afterKey, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list episode keys: %w", err)
@@ -136,6 +140,7 @@ func (s *Store) migrate() error {
 			created_at INTEGER NOT NULL
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_network ON episodes(network_sha)`,
+		`CREATE INDEX IF NOT EXISTS idx_episodes_object_key ON episodes(object_key)`,
 		`CREATE TABLE IF NOT EXISTS workers (
 			id TEXT PRIMARY KEY,
 			last_seen INTEGER NOT NULL,
