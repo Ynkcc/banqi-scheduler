@@ -63,7 +63,29 @@ type runningTask struct {
 	Games       int
 	WorkerID    string
 	CreatedAt   time.Time
+	// Done 标记任务已上报结束（rating 用）：tasks 表从不清理，
+	// 靠该标记释放 match 的在飞名额。
+	Done bool
 }
+
+// ratingInFlight 判断某 match 是否已有 rating 任务在飞。
+// 同一 match 被多个 worker 并发领取会导致重复上报（后到者必被
+// match_not_running 拒绝），这里保证同刻只有一个在飞任务；
+// 超过 ratingTaskStaleAfter 未上报的任务（worker 崩了）视为失效。
+func (s *Server) ratingInFlight(matchID int64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, t := range s.tasks {
+		if t.Kind == pb.TaskKind_TASK_RATING && t.MatchID == matchID && !t.Done &&
+			time.Since(t.CreatedAt) < ratingTaskStaleAfter {
+			return true
+		}
+	}
+	return false
+}
+
+// ratingTaskStaleAfter：rating 任务超过该时长未上报即视为失效（worker 掉线）。
+const ratingTaskStaleAfter = 10 * time.Minute
 
 // RunningTask 是进行中任务的只读快照（WebUI 展示用）。
 type RunningTask struct {
@@ -163,7 +185,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	if err != nil {
 		return nil, err
 	}
-	if m != nil {
+	if m != nil && !s.ratingInFlight(m.ID) {
 		taskID := newID()
 		resp, err := s.ratingTask(ctx, taskID, m, req)
 		if err != nil {
@@ -341,6 +363,13 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 	if task.Kind != pb.TaskKind_TASK_RATING {
 		return &pb.MatchResultAck{Accepted: false, Message: "task_is_not_rating"}, nil
 	}
+	// 任务已上报完毕：置 Done 释放 match 的在飞名额（无论本次是否被接受，
+	// 重复上报同样应释放，避免 match 卡死）
+	s.mu.Lock()
+	if t, ok := s.tasks[req.TaskId]; ok {
+		t.Done = true
+	}
+	s.mu.Unlock()
 	m, err := s.store.GetMatch(task.MatchID)
 	if err != nil {
 		return nil, err
