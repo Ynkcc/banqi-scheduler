@@ -18,7 +18,7 @@ import (
 )
 
 type Config struct {
-	Variant          string // 服务端下发的变体（4x8 / 4x4 / mini）
+	Variant          string // 服务端下发的变体（4x8 / 4x4 / 4x2）
 	GamesPerTask     int    // selfplay 每次下发的局数
 	GatekeeperGames  int    // gatekeeper 对打目标局数（成对）
 	SprtElo0         float64
