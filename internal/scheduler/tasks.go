@@ -56,6 +56,27 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "self_play_paused"}, nil
 	}
 
+	// 局面重搜（reanalysis）：按间隔节流下发，与自对弈共享算力（见 reanalysis.go）。
+	// 放在 selfplay 之前 —— 队列里的位置越早重搜收益越大（旧局面 + 当前网络）。
+	if item := s.peekReanalysisTask(); item != nil {
+		taskID, err := newID()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := s.reanalysisTask(ctx, taskID, item, req)
+		if err != nil {
+			// 组装失败（如暂无 best 网络）：不消费队首，等下次 GetTask 重试
+			log.Printf("[reanalysis] 本次无法下发（%v），保留队列待重试", err)
+		} else {
+			s.commitReanalysisTask()
+			s.registerTask(taskID, &runningTask{Kind: pb.TaskKind_TASK_REANALYSIS,
+				NetworkSha: resp.NetworkSha, Games: int(item.Positions), WorkerID: req.WorkerId, CreatedAt: time.Now()})
+			log.Printf("[task] reanalysis assigned worker=%s task=%s network=%s positions=%d",
+				req.WorkerId, taskID, resp.NetworkSha, item.Positions)
+			return resp, nil
+		}
+	}
+
 	// 常规 selfplay：拉 best 网络
 	best, err := s.store.GetBest(ctx)
 	if err != nil {
@@ -92,6 +113,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		}
 		resp.NetworkUrl = url
 	}
+	s.noteSelfplayAssigned() // 重搜节流计数
 	s.registerTask(taskID, &runningTask{Kind: pb.TaskKind_TASK_SELFPLAY, NetworkSha: best.Sha, Games: int(resp.Games), WorkerID: req.WorkerId, CreatedAt: time.Now()})
 	log.Printf("[task] selfplay assigned worker=%s task=%s network=%s games=%d data_kind=%s",
 		req.WorkerId, taskID, best.Sha, resp.Games, DataKindName(dataKind))

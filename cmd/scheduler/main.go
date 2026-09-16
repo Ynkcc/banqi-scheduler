@@ -37,6 +37,8 @@ type config struct {
 	minClientVersion        string
 	httpAddr                string
 	workerOnlineSeconds     int
+	reanalysisIntervalTasks int
+	reanalysisMaxQueue      int
 }
 
 func loadConfig() config {
@@ -56,6 +58,9 @@ func loadConfig() config {
 		minClientVersion:    os.Getenv("SCHEDULER_MIN_CLIENT_VERSION"),
 		httpAddr:            envOr("SCHEDULER_HTTP_ADDR", "127.0.0.1:8080"),
 		workerOnlineSeconds: envInt("SCHEDULER_WORKER_ONLINE_SECONDS", 60),
+		// 0 = 关闭局面重搜（trainer 提交会被拒绝，队列不积累）
+		reanalysisIntervalTasks: envInt("SCHEDULER_REANALYSIS_INTERVAL_TASKS", 0),
+		reanalysisMaxQueue:      envInt("SCHEDULER_REANALYSIS_MAX_QUEUE", 64),
 	}
 	kind, err := scheduler.ParseDataKind(envOr("SCHEDULER_DATA_KIND", "resnet"))
 	if err != nil {
@@ -143,6 +148,9 @@ func run() error {
 		SprtAlpha:        cfg.alpha,
 		SprtBeta:         cfg.beta,
 		MinClientVersion: cfg.minClientVersion,
+
+		ReanalysisIntervalTasks: cfg.reanalysisIntervalTasks,
+		ReanalysisMaxQueue:      cfg.reanalysisMaxQueue,
 	}, st, presigner)
 	if err != nil {
 		return fmt.Errorf("scheduler: %w", err)

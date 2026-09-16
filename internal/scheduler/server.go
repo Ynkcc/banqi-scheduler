@@ -33,6 +33,11 @@ type Config struct {
 	InitialRevealed  int // 课程学习初始值：仅当库中无记录时生效（运行时以 Control 为准）
 	// DataKind 自对弈任务产哪类数据（ResNet/MCTS 或 NNUE）；同样仅在库中无记录时生效。
 	DataKind pb.DataKind
+	// ReanalysisIntervalTasks 每 N 个 selfplay 任务最多下发 1 个局面重搜任务（0 = 关闭重搜）。
+	// 重搜与自对弈争抢同一份算力，故按间隔节流（见 reanalysis.go）。
+	ReanalysisIntervalTasks int
+	// ReanalysisMaxQueue 待下发重搜任务的队列上限（按载荷条数，<=0 视为不限）。
+	ReanalysisMaxQueue int
 }
 
 // extraConfig 生成 SelfPlayParams.extra_config（JSON 透传）；无课程参数时为空串。
@@ -158,6 +163,11 @@ type Server struct {
 	mu        sync.Mutex
 	tasks     map[string]*runningTask
 	lastPrune time.Time
+
+	// 待下发的重搜任务（trainer 提交，FIFO）与「自上次下发重搜以来的 selfplay 任务数」（节流）。
+	// 二者与 tasks 共用 s.mu 保护。
+	reanalysis              []*pendingReanalysis
+	reanalysisSinceSelfplay int
 }
 
 func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
