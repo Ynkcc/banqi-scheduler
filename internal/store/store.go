@@ -128,7 +128,6 @@ func (s *Store) migrate(ctx context.Context) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_network ON episodes(network_sha)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_object_key ON episodes(object_key)`,
-		`CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind)`,
 		`CREATE TABLE IF NOT EXISTS workers (
 			id TEXT PRIMARY KEY,
 			last_seen INTEGER NOT NULL,
@@ -165,6 +164,16 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 		if _, err := s.db.ExecContext(ctx, c.ddl); err != nil {
 			return fmt.Errorf("add %s.%s: %w", c.table, c.name, err)
+		}
+	}
+
+	// 依赖补列的索引必须在补列之后创建：老库上先建索引会因「no such column」直接打不开。
+	postIndexes := []string{
+		`CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind)`,
+	}
+	for _, q := range postIndexes {
+		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("exec %q: %w", q, err)
 		}
 	}
 	return nil

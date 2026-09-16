@@ -2,9 +2,61 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 )
+
+// TestMigrateFromLegacySchema 覆盖老库升级：先按「无 kind / format 列」的历史建表，
+// 再 Open()——补列与依赖新列的索引都必须成功（索引曾建在补列之前，会让老库直接打不开）。
+func TestMigrateFromLegacySchema(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "legacy.db")
+
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	legacy := []string{
+		`CREATE TABLE networks (sha TEXT PRIMARY KEY, parent_sha TEXT, created_at INTEGER NOT NULL,
+			is_best INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'candidate', notes TEXT)`,
+		`CREATE TABLE episodes (id INTEGER PRIMARY KEY AUTOINCREMENT, worker_id TEXT NOT NULL,
+			task_id TEXT NOT NULL, network_sha TEXT NOT NULL, game_count INTEGER NOT NULL,
+			total_steps INTEGER NOT NULL, winner INTEGER NOT NULL, object_key TEXT NOT NULL,
+			created_at INTEGER NOT NULL)`,
+		`CREATE TABLE workers (id TEXT PRIMARY KEY, last_seen INTEGER NOT NULL,
+			threads INTEGER NOT NULL DEFAULT 0, completed_games INTEGER NOT NULL DEFAULT 0)`,
+		`INSERT INTO networks (sha, created_at, is_best) VALUES ('sha-old', 1, 1)`,
+		`INSERT INTO episodes (worker_id, task_id, network_sha, game_count, total_steps, winner, object_key, created_at)
+			VALUES ('w0', 't0', 'sha-old', 2, 40, 1, 'episodes/sha-old/legacy.epb.gz', 1)`,
+	}
+	for _, q := range legacy {
+		if _, err := raw.ExecContext(ctx, q); err != nil {
+			t.Fatalf("legacy schema %q: %v", q, err)
+		}
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("老库升级失败: %v", err)
+	}
+	defer s.Close()
+
+	// 旧 episode 行的 kind 落到默认值 0（ResNet）
+	keys, err := s.ListEpisodeKeys(ctx, "", 10, 0)
+	if err != nil || len(keys) != 1 {
+		t.Fatalf("旧库 ResNet 类别应能列出历史对象: %v err=%v", keys, err)
+	}
+	if keys, err = s.ListEpisodeKeys(ctx, "", 10, 1); err != nil || len(keys) != 0 {
+		t.Fatalf("旧库不应有 NNUE 类别记录: %v err=%v", keys, err)
+	}
+	if n, err := s.GetNetwork(ctx, "sha-old"); err != nil || n == nil || n.Format != "onnx" {
+		t.Fatalf("旧网络应补上默认 format=onnx: %+v err=%v", n, err)
+	}
+}
 
 func TestMigrateIsIdempotent(t *testing.T) {
 	ctx := context.Background()

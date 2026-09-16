@@ -95,6 +95,6 @@ go build ./cmd/scheduler
 - 2026-09-16：**数据类别（ResNet / NNUE）贯通为可在线切换的服务端配置**（本轮不含采集端产出 NNUE 的能力）：
   - **proto**：新增 `enum DataKind`（`DATA_RESNET` / `DATA_NNUE`），落到 `SelfPlayParams.data_kind`（任务要产哪类）、`EpisodeBatch.kind`（对象自描述）、`EpisodeMeta.kind`（落库）、`ListEpisodesRequest.kind`（消费端按类别过滤，缺省不过滤）。
   - **类别来源**：`SCHEDULER_DATA_KIND`（默认 `resnet`）作为库中无记录时的初值，运行时以 `Control.dataKind` 为准，可经 WebUI `POST /api/control` 在线切换并落库 `settings.data_kind`。
-  - **落库与过滤**：`episodes` 表新增 `kind` 列（迁移按 `pragma_table_info` 补列，缺省 0 = ResNet），`ListEpisodeKeys` 支持按类别过滤（游标子查询独立于过滤条件，跨类别切换游标仍能正确推进）。
+  - **落库与过滤**：`episodes` 表新增 `kind` 列（迁移按 `pragma_table_info` 补列，缺省 0 = ResNet），`ListEpisodeKeys` 支持按类别过滤（游标子查询独立于过滤条件，跨类别切换游标仍能正确推进）。**`idx_episodes_kind` 必须建在补列之后**——建表语句块先于补列执行，把依赖新列的索引写在那里会让老库启动即 `no such column: kind`；已补 `TestMigrateFromLegacySchema` 覆盖该升级路径。
   - **`EpisodeRecord.nnue` 字段废弃**（`reserved 21`）：MCTS 自对弈不再顺带收集 NNUE 稀疏特征，两类数据彻底分家——NNUE 特征只由 `NnueEpisodeRecord` 承载；`NnueEpisodeRecord` 改为内嵌 `NnueFeatures`，稀疏特征的布局定义只此一处。
   - **语义边界**：调度器只负责下发类别，不校验 worker 是否具备该采集能力；当前 `banqi-collector` 仅支持 `DATA_RESNET`，收到 `DATA_NNUE` 任务会明确报错退出（绝不静默产出别类数据）。
