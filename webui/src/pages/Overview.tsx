@@ -7,6 +7,7 @@ import {
   Descriptions,
   InputNumber,
   Row,
+  Select,
   Space,
   Statistic,
   Switch,
@@ -18,8 +19,13 @@ import type { TableProps } from 'antd'
 import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { fmtAgo, shortSha } from '../format'
-import type { RunningTask } from '../types'
+import type { DataKind, RunningTask } from '../types'
 import { usePoll } from '../usePoll'
+
+const DATA_KIND_OPTIONS = [
+  { value: 'resnet' as DataKind, label: 'resnet（Gumbel MCTS 稠密特征）' },
+  { value: 'nnue' as DataKind, label: 'nnue（Expectimax 稀疏特征）' },
+]
 
 const taskColumns: TableProps<RunningTask>['columns'] = [
   { title: '任务', dataIndex: 'taskId', render: (v: string) => <Typography.Text code>{v.slice(0, 12)}</Typography.Text> },
@@ -41,13 +47,17 @@ export default function Overview() {
   const { data, error } = usePoll(api.status, 5000)
   const tasks = usePoll(api.tasks, 5000)
   const [revealed, setRevealed] = useState<number | null>(null)
+  const [kind, setKind] = useState<DataKind | null>(null)
   const [busy, setBusy] = useState(false)
 
   useEffect(() => {
     if (data && revealed === null) {
       setRevealed(data.initialRevealed)
     }
-  }, [data, revealed])
+    if (data && kind === null) {
+      setKind(data.dataKind)
+    }
+  }, [data, revealed, kind])
 
   const report = (e: unknown) => message.error(`操作失败：${e instanceof Error ? e.message : String(e)}`)
 
@@ -69,6 +79,19 @@ export default function Overview() {
     try {
       await api.control({ initialRevealed: revealed })
       message.success(`课程阶段已切换：initial_revealed_pieces=${revealed}`)
+    } catch (e) {
+      report(e)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const applyDataKind = async () => {
+    if (kind === null) return
+    setBusy(true)
+    try {
+      await api.control({ dataKind: kind })
+      message.success(`数据类别已切换：${kind}（对之后下发的任务生效）`)
     } catch (e) {
       report(e)
     } finally {
@@ -145,6 +168,27 @@ export default function Overview() {
                   应用
                 </Button>
                 <Typography.Text type="secondary">0 = 使用变体默认值</Typography.Text>
+              </Space>
+              <Space>
+                <span>数据类别</span>
+                <Select<DataKind>
+                  style={{ width: 280 }}
+                  value={kind ?? undefined}
+                  options={DATA_KIND_OPTIONS}
+                  disabled={busy}
+                  onChange={setKind}
+                />
+                <Button
+                  type="primary"
+                  loading={busy}
+                  disabled={kind === null || kind === data?.dataKind}
+                  onClick={applyDataKind}
+                >
+                  应用
+                </Button>
+                <Typography.Text type="secondary">
+                  自对弈产哪类训练数据；nnue 需 collector 具备 Expectimax 采集路径
+                </Typography.Text>
               </Space>
             </Space>
           </Card>

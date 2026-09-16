@@ -48,6 +48,8 @@ type Episode struct {
 	TotalSteps int
 	Winner     int
 	ObjectKey  string
+	// Kind 数据类别（pb.DataKind 的整数值：0=ResNet/MCTS，1=NNUE）。
+	Kind int
 	CreatedAt  time.Time
 }
 
@@ -121,10 +123,12 @@ func (s *Store) migrate(ctx context.Context) error {
 			total_steps INTEGER NOT NULL,
 			winner INTEGER NOT NULL,
 			object_key TEXT NOT NULL,
-			created_at INTEGER NOT NULL
+			created_at INTEGER NOT NULL,
+			kind INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_network ON episodes(network_sha)`,
 		`CREATE INDEX IF NOT EXISTS idx_episodes_object_key ON episodes(object_key)`,
+		`CREATE INDEX IF NOT EXISTS idx_episodes_kind ON episodes(kind)`,
 		`CREATE TABLE IF NOT EXISTS workers (
 			id TEXT PRIMARY KEY,
 			last_seen INTEGER NOT NULL,
@@ -149,6 +153,7 @@ func (s *Store) migrate(ctx context.Context) error {
 		{"workers", "client_version", `ALTER TABLE workers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`},
 		{"workers", "memory_mb", `ALTER TABLE workers ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0`},
 		{"networks", "format", `ALTER TABLE networks ADD COLUMN format TEXT NOT NULL DEFAULT 'onnx'`},
+		{"episodes", "kind", `ALTER TABLE episodes ADD COLUMN kind INTEGER NOT NULL DEFAULT 0`},
 	}
 	for _, c := range addColumn {
 		exists, err := s.columnExists(ctx, c.table, c.name)

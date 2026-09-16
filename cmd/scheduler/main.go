@@ -32,6 +32,7 @@ type config struct {
 	gatekeeperGames         int
 	threadsBaseline         int
 	initialRevealed         int
+	dataKind                pb.DataKind
 	elo0, elo1, alpha, beta float64
 	minClientVersion        string
 	httpAddr                string
@@ -56,6 +57,11 @@ func loadConfig() config {
 		httpAddr:            envOr("SCHEDULER_HTTP_ADDR", "127.0.0.1:8080"),
 		workerOnlineSeconds: envInt("SCHEDULER_WORKER_ONLINE_SECONDS", 60),
 	}
+	kind, err := scheduler.ParseDataKind(envOr("SCHEDULER_DATA_KIND", "resnet"))
+	if err != nil {
+		log.Printf("[config] %v，按 resnet 处理", err)
+	}
+	c.dataKind = kind
 	return c
 }
 
@@ -103,7 +109,8 @@ func run() error {
 	if *showHelp {
 		log.Println("env: SCHEDULER_LISTEN, SCHEDULER_VARIANT, SCHEDULER_DB, SCHEDULER_R2_BUCKET,",
 			"SCHEDULER_GAMES_PER_TASK, SCHEDULER_GATEKEEPER_PAIRS, SCHEDULER_THREADS_BASELINE,",
-			"SCHEDULER_INITIAL_REVEALED, SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
+			"SCHEDULER_INITIAL_REVEALED, SCHEDULER_DATA_KIND (resnet|nnue),",
+			"SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
 			"SCHEDULER_MIN_CLIENT_VERSION, SCHEDULER_HTTP_ADDR, SCHEDULER_WORKER_ONLINE_SECONDS,",
 			"AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_S3_PATH_STYLE")
 		return nil
@@ -130,6 +137,7 @@ func run() error {
 		GatekeeperGames:  cfg.gatekeeperGames,
 		ThreadsBaseline:  cfg.threadsBaseline,
 		InitialRevealed:  cfg.initialRevealed,
+		DataKind:         cfg.dataKind,
 		SprtElo0:         cfg.elo0,
 		SprtElo1:         cfg.elo1,
 		SprtAlpha:        cfg.alpha,
@@ -144,8 +152,9 @@ func run() error {
 	webui := api.New(st, srv, time.Duration(cfg.workerOnlineSeconds)*time.Second)
 	webuiSrv := webui.HTTPServer(cfg.httpAddr)
 	go func() {
-		log.Printf("[webui] listening on %s variant=%s paused=%v initial_revealed=%d",
-			cfg.httpAddr, cfg.variant, srv.Runtime().Paused, srv.Runtime().InitialRevealed)
+		log.Printf("[webui] listening on %s variant=%s paused=%v initial_revealed=%d data_kind=%s",
+			cfg.httpAddr, cfg.variant, srv.Runtime().Paused, srv.Runtime().InitialRevealed,
+			scheduler.DataKindName(srv.Runtime().DataKind))
 		if err := webuiSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("[webui] serve stopped: %v（gRPC 调度不受影响）", err)
 		}

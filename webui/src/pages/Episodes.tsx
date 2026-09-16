@@ -16,6 +16,12 @@ const columns: TableProps<Episode>['columns'] = [
     dataIndex: 'networkSha',
     render: (v: string) => <Typography.Text code>{shortSha(v)}</Typography.Text>,
   },
+  {
+    title: '类别',
+    dataIndex: 'dataKind',
+    width: 90,
+    render: (v: string) => <Tag color={v === 'nnue' ? 'purple' : 'blue'}>{v}</Tag>,
+  },
   { title: '局数', dataIndex: 'gameCount', width: 90 },
   { title: '步数', dataIndex: 'totalSteps', width: 120 },
   {

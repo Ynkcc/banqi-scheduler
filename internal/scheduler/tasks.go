@@ -70,14 +70,20 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	}
 	// 对象键恒下发（worker 的本地缓存命名依据），下载 URL 仅在需要拉取时签发
 	networkKey := r2.NetworkKey(best.Sha, best.Format)
+	// 数据类别由调度器全局决定（SCHEDULER_DATA_KIND / WebUI 在线切换），worker 据此产出
+	dataKind := s.ctl.DataKind()
 	resp := &pb.TaskResponse{
 		TaskId:           taskID,
 		Kind:             pb.TaskKind_TASK_SELFPLAY,
 		NetworkSha:       best.Sha,
 		NetworkShaRemote: best.Sha,
 		Games:            s.gamesFor(req.Threads),
-		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
-		NetworkKey:       networkKey,
+		Params: &pb.SelfPlayParams{
+			Variant:     s.cfg.Variant,
+			ExtraConfig: s.extraConfig(),
+			DataKind:    dataKind,
+		},
+		NetworkKey: networkKey,
 	}
 	if req.CurrentNetwork != best.Sha {
 		url, err := s.r2.PresignGet(ctx, networkKey)
@@ -87,7 +93,8 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		resp.NetworkUrl = url
 	}
 	s.registerTask(taskID, &runningTask{Kind: pb.TaskKind_TASK_SELFPLAY, NetworkSha: best.Sha, Games: int(resp.Games), WorkerID: req.WorkerId, CreatedAt: time.Now()})
-	log.Printf("[task] selfplay assigned worker=%s task=%s network=%s games=%d", req.WorkerId, taskID, best.Sha, resp.Games)
+	log.Printf("[task] selfplay assigned worker=%s task=%s network=%s games=%d data_kind=%s",
+		req.WorkerId, taskID, best.Sha, resp.Games, DataKindName(dataKind))
 	return resp, nil
 }
 

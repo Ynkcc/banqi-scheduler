@@ -7,8 +7,10 @@ import (
 	"strconv"
 	"time"
 
+	"banqi/server/internal/scheduler"
 	"banqi/server/internal/sprt"
 	"banqi/server/internal/store"
+	pb "banqi/server/pb"
 )
 
 const (
@@ -41,6 +43,7 @@ type statusView struct {
 	Variant          string       `json:"variant"`
 	Paused           bool         `json:"paused"`
 	InitialRevealed  int          `json:"initialRevealed"`
+	DataKind         string       `json:"dataKind"`
 	MinClientVersion string       `json:"minClientVersion"`
 	Sprt             sprtView     `json:"sprt"`
 	Best             *networkView `json:"best"`
@@ -80,6 +83,7 @@ type episodeView struct {
 	GameCount  int    `json:"gameCount"`
 	TotalSteps int    `json:"totalSteps"`
 	Winner     int    `json:"winner"`
+	DataKind   string `json:"dataKind"`
 	ObjectKey  string `json:"objectKey"`
 	CreatedAt  int64  `json:"createdAt"`
 }
@@ -102,8 +106,9 @@ type taskView struct {
 }
 
 type controlRequest struct {
-	Paused          *bool `json:"paused"`
-	InitialRevealed *int  `json:"initialRevealed"`
+	Paused          *bool   `json:"paused"`
+	InitialRevealed *int    `json:"initialRevealed"`
+	DataKind        *string `json:"dataKind"` // resnet / nnue
 }
 
 func toNetworkView(n store.Network) networkView {
@@ -129,6 +134,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		Variant:          rt.Variant,
 		Paused:           rt.Paused,
 		InitialRevealed:  rt.InitialRevealed,
+		DataKind:         scheduler.DataKindName(rt.DataKind),
 		MinClientVersion: rt.MinClientVersion,
 		Sprt:             sprtView{Elo0: rt.SprtElo0, Elo1: rt.SprtElo1, Alpha: rt.SprtAlpha, Beta: rt.SprtBeta},
 		Counts:           counts,
@@ -248,6 +254,7 @@ func (s *Server) handleEpisodes(w http.ResponseWriter, r *http.Request) {
 		out = append(out, episodeView{
 			ID: e.ID, WorkerID: e.WorkerID, TaskID: e.TaskID, NetworkSha: e.NetworkSha,
 			GameCount: e.GameCount, TotalSteps: e.TotalSteps, Winner: e.Winner,
+			DataKind:  scheduler.DataKindName(pb.DataKind(e.Kind)),
 			ObjectKey: e.ObjectKey, CreatedAt: e.CreatedAt.Unix(),
 		})
 	}
@@ -289,6 +296,18 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[webui] initial_revealed=%d", *req.InitialRevealed)
+	}
+	if req.DataKind != nil {
+		kind, err := scheduler.ParseDataKind(*req.DataKind)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.sched.Control().SetDataKind(r.Context(), kind); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[webui] data_kind=%s", scheduler.DataKindName(kind))
 	}
 	writeJSON(w, http.StatusOK, okView{OK: true})
 }

@@ -23,10 +23,14 @@ export interface Sprt {
   beta: number
 }
 
+/** 自对弈产出的数据类别（与 proto DataKind 对应） */
+export type DataKind = 'resnet' | 'nnue'
+
 export interface Status {
   variant: string
   paused: boolean
   initialRevealed: number
+  dataKind: DataKind
   minClientVersion: string
   sprt: Sprt
   best: Network | null
@@ -66,6 +70,7 @@ export interface Episode {
   gameCount: number
   totalSteps: number
   winner: number
+  dataKind: DataKind
   objectKey: string
   createdAt: number
 }

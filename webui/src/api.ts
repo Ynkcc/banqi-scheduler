@@ -1,4 +1,4 @@
-import type { EpisodePage, Match, Network, RunningTask, Status, WorkerInfo } from './types'
+import type { DataKind, EpisodePage, Match, Network, RunningTask, Status, WorkerInfo } from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
@@ -27,7 +27,7 @@ export const api = {
   tasks: () => request<RunningTask[]>('/api/tasks'),
   episodes: (before: number, limit = 100) =>
     request<EpisodePage>(`/api/episodes?before=${before}&limit=${limit}`),
-  control: (body: { paused?: boolean; initialRevealed?: number }) =>
+  control: (body: { paused?: boolean; initialRevealed?: number; dataKind?: DataKind }) =>
     request<{ ok: boolean }>('/api/control', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },

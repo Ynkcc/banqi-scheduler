@@ -27,14 +27,14 @@
 
 ## 3. gRPC 契约（scheduler.proto，9 RPC）
 
-- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；
-- `ReportEpisode`：只收元数据，签发 R2 预签名 PUT（对象键 `episodes/<sha>/<id>.epb.gz`），数据直传 R2（校验 task↔worker 归属）；
+- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；selfplay 另经 `SelfPlayParams.data_kind` 下发**数据类别**（`SCHEDULER_DATA_KIND` / WebUI，见 `DataKind`），worker 据此产出对应类别的记录；
+- `ReportEpisode`：只收元数据（含数据类别 `kind`，落库 `episodes.kind`），签发 R2 预签名 PUT（对象键 `episodes/<sha>/<id>.epb.gz`），数据直传 R2（校验 task↔worker 归属）；
 - `GetNetwork`：sha 或 best → 对象键 + 预签名 GET；
 - `RegisterNetwork`：trainer 登记新网络（含权重格式 `format`，落库 `networks.format`）→ 自动创建 gatekeeper 对打；首个网络直接晋级；格式不在白名单（onnx/pt/nnue）时拒绝登记；
 - `ReportMatchResult`：五项成对计数累计 → GSPRT 判停 → 晋级/拒绝 best 指针；
 - `Heartbeat`：worker 状态（client_version/memory_mb/running_task_id）+ best sha 下发；
 - `SignNetworkUpload`：trainer 请求网络直传预签名 PUT（须声明权重格式 `format`，对象键 `networks/<sha>.<format>`）；
-- `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；
+- `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；可带 `kind` 只取某一数据类别（缺省不过滤），消费方据此避免下载无法消费的对象；
 - `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）。
 
 **安全约定**：R2 凭据只在调度器持有，worker/trainer 零存储配置，全部经预签名 URL 上下行。
@@ -73,7 +73,7 @@ go build ./cmd/scheduler
 | 路由 | 说明 |
 |---|---|
 | `POST /api/networks/{sha}/promote` | 手动晋级 best |
-| `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发 |
+| `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发；`{"dataKind":"resnet"\|"nnue"}` 在线切换自对弈产出的数据类别，经 `SelfPlayParams.data_kind` 下发 |
 
 内存任务表保留策略（见 `internal/scheduler/server.go`）：tasks 仅用于 task↔worker 归属校验与 rating 在飞判定，进度以 DB 为准；已上报结束（`Done`）的记录保留 `doneTaskRetention`(30m)、未上报记录最多保留 `taskMaxRetention`(24h)，由 `pruneTasks` 在 `GetTask` 路径上按 `pruneInterval`(1m) 节流回收；`/api/tasks` 只展示未结束任务。
 
@@ -92,3 +92,9 @@ go build ./cmd/scheduler
   - **权重键**：`networks/<sha>.bin` → `networks/<sha>.<format>`；`networks` 表新增 `format` 列（默认 `onnx`，迁移按 `pragma_table_info` 探测补列），权重格式由上传方在 `SignNetworkUpload` 与 `RegisterNetwork` 两处声明并由调度器按白名单（onnx/pt/nnue）校验，任一为空或非法即拒绝，避免生成无法下载的键。
   - **下发给 worker 的对象键**：`TaskResponse.network_key` / `opponent_key` 恒下发（本地缓存命名与权重格式判定的依据），`NetworkInfo.key` 供心跳预取使用；下载 URL 仍在需要拉取时才签发。旧缓存与旧对象作废（用户确认不做兼容）。
   - **新增训练数据记录消息**：`EpisodeBatch` / `EpisodeRecord` / `NnueEpisodeRecord` / `NnueFeatures` / `NnueMeta`（字段号 + `schema_version`）。调度器只登记元数据、不解析对象内容，本组消息由采集端与训练端共享。
+- 2026-09-16：**数据类别（ResNet / NNUE）贯通为可在线切换的服务端配置**（本轮不含采集端产出 NNUE 的能力）：
+  - **proto**：新增 `enum DataKind`（`DATA_RESNET` / `DATA_NNUE`），落到 `SelfPlayParams.data_kind`（任务要产哪类）、`EpisodeBatch.kind`（对象自描述）、`EpisodeMeta.kind`（落库）、`ListEpisodesRequest.kind`（消费端按类别过滤，缺省不过滤）。
+  - **类别来源**：`SCHEDULER_DATA_KIND`（默认 `resnet`）作为库中无记录时的初值，运行时以 `Control.dataKind` 为准，可经 WebUI `POST /api/control` 在线切换并落库 `settings.data_kind`。
+  - **落库与过滤**：`episodes` 表新增 `kind` 列（迁移按 `pragma_table_info` 补列，缺省 0 = ResNet），`ListEpisodeKeys` 支持按类别过滤（游标子查询独立于过滤条件，跨类别切换游标仍能正确推进）。
+  - **`EpisodeRecord.nnue` 字段废弃**（`reserved 21`）：MCTS 自对弈不再顺带收集 NNUE 稀疏特征，两类数据彻底分家——NNUE 特征只由 `NnueEpisodeRecord` 承载；`NnueEpisodeRecord` 改为内嵌 `NnueFeatures`，稀疏特征的布局定义只此一处。
+  - **语义边界**：调度器只负责下发类别，不校验 worker 是否具备该采集能力；当前 `banqi-collector` 仅支持 `DATA_RESNET`，收到 `DATA_NNUE` 任务会明确报错退出（绝不静默产出别类数据）。

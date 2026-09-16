@@ -31,6 +31,8 @@ type Config struct {
 	MinClientVersion string
 	ThreadsBaseline  int // 资源分配基准线程数：games = GamesPerTask × threads/baseline（<=0 则不缩放）
 	InitialRevealed  int // 课程学习初始值：仅当库中无记录时生效（运行时以 Control 为准）
+	// DataKind 自对弈任务产哪类数据（ResNet/MCTS 或 NNUE）；同样仅在库中无记录时生效。
+	DataKind pb.DataKind
 }
 
 // extraConfig 生成 SelfPlayParams.extra_config（JSON 透传）；无课程参数时为空串。
@@ -143,6 +145,7 @@ type Runtime struct {
 	SprtBeta         float64
 	Paused           bool
 	InitialRevealed  int
+	DataKind         pb.DataKind
 }
 
 type Server struct {
@@ -158,7 +161,7 @@ type Server struct {
 }
 
 func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
-	ctl, err := loadControl(ctx, st, cfg.InitialRevealed)
+	ctl, err := loadControl(ctx, st, cfg.InitialRevealed, cfg.DataKind)
 	if err != nil {
 		return nil, fmt.Errorf("load control: %w", err)
 	}
@@ -177,6 +180,7 @@ func (s *Server) Runtime() Runtime {
 		SprtBeta:         s.cfg.SprtBeta,
 		Paused:           s.ctl.Paused(),
 		InitialRevealed:  s.ctl.InitialRevealed(),
+		DataKind:         s.ctl.DataKind(),
 	}
 }
 

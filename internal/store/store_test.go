@@ -119,17 +119,31 @@ func TestMatchesEpisodesWorkersRoundTrip(t *testing.T) {
 		GameCount: 3, TotalSteps: 99, Winner: 1, ObjectKey: "episodes/sha-best/a.epb.gz"}); err != nil {
 		t.Fatalf("insert episode: %v", err)
 	}
+	// 第二条为 NNUE 类别：验证按类别过滤时游标仍按登记顺序推进
+	if err := s.InsertEpisode(ctx, Episode{WorkerID: "w1", TaskID: "t2", NetworkSha: "sha-best",
+		GameCount: 5, TotalSteps: 120, Winner: -1, ObjectKey: "episodes/sha-best/b.epb.gz", Kind: 1}); err != nil {
+		t.Fatalf("insert nnue episode: %v", err)
+	}
 	eps, err := s.ListEpisodes(ctx, 0, 10)
-	if err != nil || len(eps) != 1 || eps[0].GameCount != 3 {
+	if err != nil || len(eps) != 2 || eps[0].GameCount != 5 {
 		t.Fatalf("list episodes: %+v err=%v", eps, err)
 	}
-	keys, err := s.ListEpisodeKeys(ctx, "", 10)
-	if err != nil || len(keys) != 1 {
+	keys, err := s.ListEpisodeKeys(ctx, "", 10, KindAny)
+	if err != nil || len(keys) != 2 {
 		t.Fatalf("list episode keys: %v err=%v", keys, err)
 	}
-	keys, err = s.ListEpisodeKeys(ctx, keys[0], 10)
+	// 只取 ResNet 类别：NNUE 对象不出现，且游标仍可正常推进到末尾
+	keys, err = s.ListEpisodeKeys(ctx, "", 10, 0)
+	if err != nil || len(keys) != 1 || keys[0] != "episodes/sha-best/a.epb.gz" {
+		t.Fatalf("按类别过滤应只返回 ResNet 对象: %v err=%v", keys, err)
+	}
+	keys, err = s.ListEpisodeKeys(ctx, keys[0], 10, 0)
 	if err != nil || len(keys) != 0 {
 		t.Fatalf("游标应推进到末尾: %v err=%v", keys, err)
+	}
+	keys, err = s.ListEpisodeKeys(ctx, "", 10, 1)
+	if err != nil || len(keys) != 1 || keys[0] != "episodes/sha-best/b.epb.gz" {
+		t.Fatalf("按类别过滤应只返回 NNUE 对象: %v err=%v", keys, err)
 	}
 
 	if err := s.TouchWorker(ctx, "w1", 8, 42, "v1.2.3", 1024); err != nil {
@@ -147,7 +161,7 @@ func TestMatchesEpisodesWorkersRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("counts: %v", err)
 	}
-	if c.Networks != 2 || c.Episodes != 1 || c.EpisodeGames != 3 || c.Workers != 1 || c.MatchesRunning != 0 {
+	if c.Networks != 2 || c.Episodes != 2 || c.EpisodeGames != 8 || c.Workers != 1 || c.MatchesRunning != 0 {
 		t.Fatalf("unexpected counts %+v", c)
 	}
 }
