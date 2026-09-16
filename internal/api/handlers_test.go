@@ -77,7 +77,7 @@ func TestPromoteEndpoint(t *testing.T) {
 	s, st := newTestServer(t)
 	ctx := context.Background()
 
-	if _, err := st.RegisterNetwork(ctx, "sha-x", "", ""); err != nil {
+	if _, err := st.RegisterNetwork(ctx, "sha-x", "", "", "onnx"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 

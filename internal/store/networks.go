@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-const networkColumns = `sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,'')`
+const networkColumns = `sha, COALESCE(parent_sha,''), created_at, is_best, status, COALESCE(notes,''), format`
 
 // scanNetworkRow 统一 networks 行扫描，*sql.Row 与 *sql.Rows 通用。
 func scanNetworkRow(row interface{ Scan(...any) error }) (*Network, error) {
 	n := &Network{}
 	var createdAt int64
-	if err := row.Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes); err != nil {
+	if err := row.Scan(&n.Sha, &n.ParentSha, &createdAt, &n.IsBest, &n.Status, &n.Notes, &n.Format); err != nil {
 		return nil, err
 	}
 	n.CreatedAt = time.Unix(createdAt, 0)
@@ -42,10 +42,10 @@ func (s *Store) GetNetwork(ctx context.Context, sha string) (*Network, error) {
 	return n, nil
 }
 
-func (s *Store) RegisterNetwork(ctx context.Context, sha, parentSha, notes string) (created bool, err error) {
+func (s *Store) RegisterNetwork(ctx context.Context, sha, parentSha, notes, format string) (created bool, err error) {
 	now := time.Now().Unix()
-	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO networks (sha, parent_sha, created_at, status, notes) VALUES (?,?,?,'candidate',?)`,
-		sha, parentSha, now, notes)
+	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO networks (sha, parent_sha, created_at, status, notes, format) VALUES (?,?,?,'candidate',?,?)`,
+		sha, parentSha, now, notes, format)
 	if err != nil {
 		return false, fmt.Errorf("insert network %s: %w", sha, err)
 	}

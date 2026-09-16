@@ -4,12 +4,25 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 
 	"banqi/server/internal/r2"
 	"banqi/server/internal/sprt"
 	"banqi/server/internal/store"
 	pb "banqi/server/pb"
 )
+
+// 权重格式白名单：扩展名即内容格式，worker 据此分派加载器。
+var validFormats = map[string]bool{"onnx": true, "pt": true, "nnue": true}
+
+// normalizeFormat 归一化并校验上传/登记声明的权重格式。
+func normalizeFormat(format string) (string, error) {
+	f := strings.ToLower(strings.TrimSpace(format))
+	if !validFormats[f] {
+		return "", fmt.Errorf("unsupported_format=%q (want onnx/pt/nnue)", format)
+	}
+	return f, nil
+}
 
 // GetNetwork 下发网络下载信息：sha 为空时取 best。
 func (s *Server) GetNetwork(ctx context.Context, req *pb.NetworkRequest) (*pb.NetworkInfo, error) {
@@ -26,13 +39,14 @@ func (s *Server) GetNetwork(ctx context.Context, req *pb.NetworkRequest) (*pb.Ne
 	if n == nil {
 		return nil, fmt.Errorf("network not found sha=%q", req.Sha)
 	}
-	url, err := s.r2.PresignGet(ctx, r2.NetworkKey(n.Sha))
+	key := r2.NetworkKey(n.Sha, n.Format)
+	url, err := s.r2.PresignGet(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("presign network %s: %w", n.Sha, err)
+		return nil, fmt.Errorf("presign network %s: %w", key, err)
 	}
 	return &pb.NetworkInfo{
 		Sha: n.Sha, DownloadUrl: url, CreatedAt: n.CreatedAt.Unix(), IsBest: n.IsBest,
-		GameData: fmt.Sprintf(`{"parent_sha":%q}`, n.ParentSha),
+		GameData: fmt.Sprintf(`{"parent_sha":%q}`, n.ParentSha), Key: key,
 	}, nil
 }
 
@@ -45,7 +59,11 @@ func (s *Server) RegisterNetwork(ctx context.Context, req *pb.RegisterNetworkReq
 	if best != nil && best.Sha == req.Sha {
 		return &pb.RegisterNetworkAck{Accepted: false, Message: "sha_equals_current_best"}, nil
 	}
-	created, err := s.store.RegisterNetwork(ctx, req.Sha, req.ParentSha, req.Notes)
+	format, err := normalizeFormat(req.Format)
+	if err != nil {
+		return &pb.RegisterNetworkAck{Accepted: false, Message: err.Error()}, nil
+	}
+	created, err := s.store.RegisterNetwork(ctx, req.Sha, req.ParentSha, req.Notes, format)
 	if err != nil {
 		return nil, fmt.Errorf("register network %s: %w", req.Sha, err)
 	}

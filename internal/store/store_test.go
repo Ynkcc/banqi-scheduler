@@ -50,11 +50,11 @@ func TestRegisterNetworkAndSettings(t *testing.T) {
 	}
 	defer s.Close()
 
-	created, err := s.RegisterNetwork(ctx, "sha-a", "", "n1")
+	created, err := s.RegisterNetwork(ctx, "sha-a", "", "n1", "onnx")
 	if err != nil || !created {
 		t.Fatalf("首次登记应创建: created=%v err=%v", created, err)
 	}
-	created, err = s.RegisterNetwork(ctx, "sha-a", "", "dup")
+	created, err = s.RegisterNetwork(ctx, "sha-a", "", "dup", "onnx")
 	if err != nil {
 		t.Fatalf("重复登记不应报错: %v", err)
 	}
@@ -84,7 +84,7 @@ func TestMatchesEpisodesWorkersRoundTrip(t *testing.T) {
 
 	// matches 对 networks 有外键约束，先登记双方网络
 	for _, sha := range []string{"sha-cand", "sha-best"} {
-		if _, err := s.RegisterNetwork(ctx, sha, "", ""); err != nil {
+		if _, err := s.RegisterNetwork(ctx, sha, "", "", "onnx"); err != nil {
 			t.Fatalf("register %s: %v", sha, err)
 		}
 	}
@@ -116,7 +116,7 @@ func TestMatchesEpisodesWorkersRoundTrip(t *testing.T) {
 	}
 
 	if err := s.InsertEpisode(ctx, Episode{WorkerID: "w1", TaskID: "t1", NetworkSha: "sha-best",
-		GameCount: 3, TotalSteps: 99, Winner: 1, ObjectKey: "episodes/sha-best/a.jsonl.gz"}); err != nil {
+		GameCount: 3, TotalSteps: 99, Winner: 1, ObjectKey: "episodes/sha-best/a.epb.gz"}); err != nil {
 		t.Fatalf("insert episode: %v", err)
 	}
 	eps, err := s.ListEpisodes(ctx, 0, 10)

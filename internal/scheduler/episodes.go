@@ -44,19 +44,24 @@ func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.Ep
 }
 
 // SignNetworkUpload 为 trainer 签发网络直传 R2 的预签名 PUT。
-// R2 凭据只在调度器持有：对象键由 sha 决定（networks/<sha>.bin），trainer 零存储配置。
+// R2 凭据只在调度器持有：对象键由 sha + 权重格式决定
+// （networks/<sha>.<onnx|pt|nnue>），trainer 零存储配置。
 func (s *Server) SignNetworkUpload(ctx context.Context, req *pb.SignNetworkUploadRequest) (*pb.SignNetworkUploadAck, error) {
 	sha := strings.TrimSpace(req.Sha)
 	if len(sha) != 64 {
 		return &pb.SignNetworkUploadAck{Accepted: false,
 			Message: fmt.Sprintf("invalid_sha_len=%d (want 64 hex chars)", len(sha))}, nil
 	}
-	key := r2.NetworkKey(sha)
+	format, err := normalizeFormat(req.Format)
+	if err != nil {
+		return &pb.SignNetworkUploadAck{Accepted: false, Message: err.Error()}, nil
+	}
+	key := r2.NetworkKey(sha, format)
 	url, err := s.r2.PresignPut(ctx, key, req.ContentLength)
 	if err != nil {
-		return nil, fmt.Errorf("presign network upload %s: %w", sha, err)
+		return nil, fmt.Errorf("presign network upload %s: %w", key, err)
 	}
-	log.Printf("[network] sign upload trainer=%s sha=%s len=%d", req.TrainerId, sha, req.ContentLength)
+	log.Printf("[network] sign upload trainer=%s key=%s len=%d", req.TrainerId, key, req.ContentLength)
 	return &pb.SignNetworkUploadAck{Accepted: true, UploadUrl: url, ObjectKey: key}, nil
 }
 

@@ -17,9 +17,9 @@
 | `go.mod` | module `banqi/server` |
 | `cmd/scheduler/main.go` | 入口：`run()` 编排生命周期（`signal.NotifyContext` → `GracefulStop` + WebUI `Shutdown`），配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明）。另读标准 `AWS_*` 凭据/endpoint，`AWS_S3_PATH_STYLE=1` 时改用 path-style 寻址（本地 RustFS / MinIO 必需，R2 默认不设） |
 | `internal/store` | SQLite 元数据，全部方法以 `context` 为首参；文件按表拆分：`store.go`（连接/迁移/统计/设置）、`networks.go`、`matches.go`、`episodes.go`、`workers.go`；迁移用 `pragma_table_info` 探测列存在性，best 指针事务切换 |
-| `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.jsonl.gz`、`networks/<sha>.bin` |
+| `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.epb.gz`（EpisodeBatch 二进制记录）、`networks/<sha>.<format>`（扩展名 = 权重格式 onnx/pt/nnue，worker 据此分派加载器） |
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
-| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask）、`networks.go`（登记/晋级/gatekeeper 判停）、`episodes.go`（episode 登记与 trainer 数据面）、`control.go`（运行时控制，落库 settings） |
+| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask，下发 `network_key`/`opponent_key`）、`networks.go`（登记/晋级/gatekeeper 判停 + 权重格式白名单校验）、`episodes.go`（episode 登记与 trainer 数据面）、`control.go`（运行时控制，落库 settings） |
 | `internal/api` | WebUI 的 JSON API + 控制端点 + embed 前端产物（`HTTPServer(addr)` 交由调用方启停，同进程 http.Server） |
 | `webui/` | React 18 + Vite + TS + AntD 前端源码，构建产物输出到 `internal/api/dist` |
 | `pb/` | protoc 生成代码（不提交） |
@@ -27,13 +27,13 @@
 
 ## 3. gRPC 契约（scheduler.proto，9 RPC）
 
-- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；
-- `ReportEpisode`：只收元数据，签发 R2 预签名 PUT，数据直传 R2（校验 task↔worker 归属）；
-- `GetNetwork`：sha 或 best → 预签名 GET；
-- `RegisterNetwork`：trainer 登记新网络 → 自动创建 gatekeeper 对打；首个网络直接晋级；
+- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；
+- `ReportEpisode`：只收元数据，签发 R2 预签名 PUT（对象键 `episodes/<sha>/<id>.epb.gz`），数据直传 R2（校验 task↔worker 归属）；
+- `GetNetwork`：sha 或 best → 对象键 + 预签名 GET；
+- `RegisterNetwork`：trainer 登记新网络（含权重格式 `format`，落库 `networks.format`）→ 自动创建 gatekeeper 对打；首个网络直接晋级；格式不在白名单（onnx/pt/nnue）时拒绝登记；
 - `ReportMatchResult`：五项成对计数累计 → GSPRT 判停 → 晋级/拒绝 best 指针；
 - `Heartbeat`：worker 状态（client_version/memory_mb/running_task_id）+ best sha 下发；
-- `SignNetworkUpload`：trainer 请求网络直传预签名 PUT；
+- `SignNetworkUpload`：trainer 请求网络直传预签名 PUT（须声明权重格式 `format`，对象键 `networks/<sha>.<format>`）；
 - `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；
 - `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）。
 
@@ -87,3 +87,8 @@ go build ./cmd/scheduler
 - 2026-09-14：`internal/r2` 新增 `AWS_S3_PATH_STYLE`（默认关闭）以支持 RustFS / MinIO 等无法 virtual-host 寻址的本地 S3 实现；启动时打印 `path_style` 便于排查。R2 侧行为不变。
 - 2026-09-15：运行时健壮性改造：①`cmd/scheduler/main.go` 改为 `run()` + `signal.NotifyContext`，收到 SIGINT/SIGTERM 后 `grpcServer.GracefulStop()` 并 `Shutdown` WebUI，启动失败路径不再被 `log.Fatalf` 跳过 defer；②内存任务表新增超期回收（`pruneTasks`，`Done` 保留 30m / 未上报最多 24h，`pruneInterval` 节流），`/api/tasks` 不再展示已结束任务；③`internal/store` 全部方法改为 ctx 首参（`QueryContext`/`ExecContext`/`BeginTx`），调用方传请求 ctx；④建表迁移改用 `pragma_table_info` 探测列存在性（删除依赖驱动错误文案的 `duplicate column name` 匹配与 `q[:40]` 切片），`RowsAffected` 错误不再被忽略；⑤`newID` 由 panic 改为返回错误；⑥gRPC 层错误补上下文（`fmt.Errorf("...: %w")`）；⑦`internal/api` 的 `ListenAndServe` 改为 `HTTPServer(addr)`，生命周期交由 `cmd/scheduler` 编排。新增 `internal/store/store_test.go`、`internal/scheduler/server_test.go`。
 - 2026-09-15：文件拆分（降低单文件认知负荷）：`internal/store/store.go`(455 行) 拆为 `store.go` / `networks.go` / `matches.go` / `episodes.go` / `workers.go`（并抽出 `matchColumns` 统一列序）；`internal/scheduler/server.go`(495→544 行) 拆为 `server.go` / `tasks.go` / `networks.go` / `episodes.go`（新增 `lookupTask` / `markTaskDone` / `registerTask` / `judgeMatch` 辅助），单文件均 < 250 行。新增 `internal/api/handlers_test.go`（status/tasks/promote/control 与错误码）。`internal/sprt/sprt.go` 补 gofmt。
+- 2026-09-16：**对象键自描述与训练数据记录 schema 化**（一侧改动，两侧契约同步——proto 变更已同步到 banqi-collector / banqi-training 副本）：
+  - **episode 键**：`episodes/<sha>/<id>.jsonl.gz` → `episodes/<sha>/<id>.epb.gz`（载荷为 `EpisodeBatch` 二进制，schema 定义在 proto）。
+  - **权重键**：`networks/<sha>.bin` → `networks/<sha>.<format>`；`networks` 表新增 `format` 列（默认 `onnx`，迁移按 `pragma_table_info` 探测补列），权重格式由上传方在 `SignNetworkUpload` 与 `RegisterNetwork` 两处声明并由调度器按白名单（onnx/pt/nnue）校验，任一为空或非法即拒绝，避免生成无法下载的键。
+  - **下发给 worker 的对象键**：`TaskResponse.network_key` / `opponent_key` 恒下发（本地缓存命名与权重格式判定的依据），`NetworkInfo.key` 供心跳预取使用；下载 URL 仍在需要拉取时才签发。旧缓存与旧对象作废（用户确认不做兼容）。
+  - **新增训练数据记录消息**：`EpisodeBatch` / `EpisodeRecord` / `NnueEpisodeRecord` / `NnueFeatures` / `NnueMeta`（字段号 + `schema_version`）。调度器只登记元数据、不解析对象内容，本组消息由采集端与训练端共享。

@@ -68,6 +68,8 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	if err != nil {
 		return nil, err
 	}
+	// 对象键恒下发（worker 的本地缓存命名依据），下载 URL 仅在需要拉取时签发
+	networkKey := r2.NetworkKey(best.Sha, best.Format)
 	resp := &pb.TaskResponse{
 		TaskId:           taskID,
 		Kind:             pb.TaskKind_TASK_SELFPLAY,
@@ -75,11 +77,12 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 		NetworkShaRemote: best.Sha,
 		Games:            s.gamesFor(req.Threads),
 		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
+		NetworkKey:       networkKey,
 	}
 	if req.CurrentNetwork != best.Sha {
-		url, err := s.r2.PresignGet(ctx, r2.NetworkKey(best.Sha))
+		url, err := s.r2.PresignGet(ctx, networkKey)
 		if err != nil {
-			return nil, fmt.Errorf("presign best network %s: %w", best.Sha, err)
+			return nil, fmt.Errorf("presign best network %s: %w", networkKey, err)
 		}
 		resp.NetworkUrl = url
 	}
@@ -105,6 +108,24 @@ func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, 
 	if scaled := s.gamesFor(req.Threads); int(scaled) < games {
 		games = int(scaled)
 	}
+	// 对象键需按各自权重格式构造（候选与对手可能格式不同）
+	candidate, err := s.store.GetNetwork(ctx, m.Candidate)
+	if err != nil {
+		return nil, fmt.Errorf("get candidate network %s: %w", m.Candidate, err)
+	}
+	if candidate == nil {
+		return nil, fmt.Errorf("candidate network not found sha=%s", m.Candidate)
+	}
+	opponent, err := s.store.GetNetwork(ctx, m.Opponent)
+	if err != nil {
+		return nil, fmt.Errorf("get opponent network %s: %w", m.Opponent, err)
+	}
+	if opponent == nil {
+		return nil, fmt.Errorf("opponent network not found sha=%s", m.Opponent)
+	}
+	candidateKey := r2.NetworkKey(candidate.Sha, candidate.Format)
+	opponentKey := r2.NetworkKey(opponent.Sha, opponent.Format)
+
 	resp := &pb.TaskResponse{
 		TaskId:           taskID,
 		Kind:             pb.TaskKind_TASK_RATING,
@@ -113,14 +134,16 @@ func (s *Server) ratingTask(ctx context.Context, taskID string, m *store.Match, 
 		NetworkShaRemote: m.Candidate,
 		Games:            int32(games),
 		Params:           &pb.SelfPlayParams{Variant: s.cfg.Variant, ExtraConfig: s.extraConfig()},
+		NetworkKey:       candidateKey,
+		OpponentKey:      opponentKey,
 	}
-	candidateURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Candidate))
+	candidateURL, err := s.r2.PresignGet(ctx, candidateKey)
 	if err != nil {
-		return nil, fmt.Errorf("presign candidate %s: %w", m.Candidate, err)
+		return nil, fmt.Errorf("presign candidate %s: %w", candidateKey, err)
 	}
-	opponentURL, err := s.r2.PresignGet(ctx, r2.NetworkKey(m.Opponent))
+	opponentURL, err := s.r2.PresignGet(ctx, opponentKey)
 	if err != nil {
-		return nil, fmt.Errorf("presign opponent %s: %w", m.Opponent, err)
+		return nil, fmt.Errorf("presign opponent %s: %w", opponentKey, err)
 	}
 	resp.NetworkUrl = candidateURL
 	resp.OpponentUrl = opponentURL

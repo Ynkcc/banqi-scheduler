@@ -26,6 +26,7 @@ type Network struct {
 	IsBest    bool
 	Status    string // candidate | best | rejected
 	Notes     string
+	Format    string // 权重格式（onnx / pt / nnue）：决定 R2 对象键扩展名
 }
 
 type Match struct {
@@ -95,7 +96,8 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at INTEGER NOT NULL,
 			is_best INTEGER NOT NULL DEFAULT 0,
 			status TEXT NOT NULL DEFAULT 'candidate',
-			notes TEXT
+			notes TEXT,
+			format TEXT NOT NULL DEFAULT 'onnx'
 		)`,
 		`CREATE TABLE IF NOT EXISTS matches (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,13 +144,14 @@ func (s *Store) migrate(ctx context.Context) error {
 		}
 	}
 
-	// 旧库升级：workers 表补列。按实际列存在性判断，不依赖驱动的错误文案。
-	addColumn := []struct{ name, ddl string }{
-		{"client_version", `ALTER TABLE workers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`},
-		{"memory_mb", `ALTER TABLE workers ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0`},
+	// 旧库升级：补列。按实际列存在性判断，不依赖驱动的错误文案。
+	addColumn := []struct{ table, name, ddl string }{
+		{"workers", "client_version", `ALTER TABLE workers ADD COLUMN client_version TEXT NOT NULL DEFAULT ''`},
+		{"workers", "memory_mb", `ALTER TABLE workers ADD COLUMN memory_mb INTEGER NOT NULL DEFAULT 0`},
+		{"networks", "format", `ALTER TABLE networks ADD COLUMN format TEXT NOT NULL DEFAULT 'onnx'`},
 	}
 	for _, c := range addColumn {
-		exists, err := s.columnExists(ctx, "workers", c.name)
+		exists, err := s.columnExists(ctx, c.table, c.name)
 		if err != nil {
 			return err
 		}
@@ -156,7 +159,7 @@ func (s *Store) migrate(ctx context.Context) error {
 			continue
 		}
 		if _, err := s.db.ExecContext(ctx, c.ddl); err != nil {
-			return fmt.Errorf("add workers.%s: %w", c.name, err)
+			return fmt.Errorf("add %s.%s: %w", c.table, c.name, err)
 		}
 	}
 	return nil
