@@ -17,6 +17,9 @@ const (
 	defaultEpisodeLimit = 100
 	maxEpisodeLimit     = 500
 	maxControlBody      = 4096
+	// 绝对强度评估：明细与趋势各取多少条（趋势用于画版本曲线，无需全量）
+	evalLatestLimit = 200
+	evalTrendLimit  = 50
 )
 
 type okView struct {
@@ -40,14 +43,90 @@ type sprtView struct {
 }
 
 type statusView struct {
-	Variant          string       `json:"variant"`
-	Paused           bool         `json:"paused"`
-	InitialRevealed  int          `json:"initialRevealed"`
-	DataKind         string       `json:"dataKind"`
-	MinClientVersion string       `json:"minClientVersion"`
-	Sprt             sprtView     `json:"sprt"`
-	Best             *networkView `json:"best"`
-	Counts           store.Counts `json:"counts"`
+	Variant          string         `json:"variant"`
+	Paused           bool           `json:"paused"`
+	InitialRevealed  int            `json:"initialRevealed"`
+	DataKind         string         `json:"dataKind"`
+	MinClientVersion string         `json:"minClientVersion"`
+	Sprt             sprtView       `json:"sprt"`
+	Best             *networkView   `json:"best"`
+	Counts           store.Counts   `json:"counts"`
+	Eval             evalConfigView `json:"eval"`
+	// ShouldStop 绝对强度判据置位的停机信号（trainer 轮询 GetInfo 后优雅停止）。
+	ShouldStop bool   `json:"shouldStop"`
+	StopReason string `json:"stopReason"`
+}
+
+// evalConfigView 评估配置快照（WebUI 面板表头 + /api/status 展示）。
+type evalConfigView struct {
+	Enabled          bool     `json:"enabled"`
+	Opponents        []string `json:"opponents"`
+	Games            int      `json:"games"`
+	MctsSims         int      `json:"mctsSims"`
+	Mode             string   `json:"mode"`
+	EveryNPromotions int      `json:"everyNPromotions"`
+	NoProgressN      int      `json:"noProgressN"`
+	NoProgressEps    float64  `json:"noProgressEps"`
+	Pending          int      `json:"pending"`
+}
+
+type evalResultView struct {
+	NetworkSha   string  `json:"networkSha"`
+	OpponentSpec string  `json:"opponentSpec"`
+	Wins         int     `json:"wins"`
+	Draws        int     `json:"draws"`
+	Losses       int     `json:"losses"`
+	NumGames     int     `json:"numGames"`
+	WinRate      float64 `json:"winRate"`
+	AvgMoves     float64 `json:"avgMoves"`
+	CreatedAt    int64   `json:"createdAt"`
+}
+
+// evalTrendView 单对手的版本序列（升序），含「连续无提升」计数供界面直接展示。
+type evalTrendView struct {
+	Opponent      string           `json:"opponent"`
+	Versions      int              `json:"versions"`
+	NoProgress    int              `json:"noProgress"`
+	LatestWinRate float64          `json:"latestWinRate"`
+	Points        []evalResultView `json:"points"`
+}
+
+type evalView struct {
+	Config     evalConfigView   `json:"config"`
+	ShouldStop bool             `json:"shouldStop"`
+	StopReason string           `json:"stopReason"`
+	Latest     []evalResultView `json:"latest"`
+	Trends     []evalTrendView  `json:"trends"`
+}
+
+// evalModeName 评估搜索模式的可读名（与 scheduler 侧日志口径一致）。
+func evalModeName(mctsSims int) string {
+	if mctsSims <= 0 {
+		return "纯策略 argmax"
+	}
+	return "MCTS " + strconv.Itoa(mctsSims) + " sims"
+}
+
+func toEvalConfigView(rt scheduler.Runtime, pending int) evalConfigView {
+	return evalConfigView{
+		Enabled:          rt.EvalEnabled,
+		Opponents:        rt.EvalOpponents,
+		Games:            rt.EvalGames,
+		MctsSims:         rt.EvalMctsSims,
+		Mode:             evalModeName(rt.EvalMctsSims),
+		EveryNPromotions: rt.EvalEveryNPromotions,
+		NoProgressN:      rt.EvalNoProgressN,
+		NoProgressEps:    rt.EvalNoProgressEps,
+		Pending:          pending,
+	}
+}
+
+func toEvalResultView(e store.EvalResult) evalResultView {
+	return evalResultView{
+		NetworkSha: e.NetworkSha, OpponentSpec: e.OpponentSpec,
+		Wins: e.Wins, Draws: e.Draws, Losses: e.Losses, NumGames: e.NumGames,
+		WinRate: e.WinRate(), AvgMoves: e.AvgMoves, CreatedAt: e.CreatedAt.Unix(),
+	}
 }
 
 type matchView struct {
@@ -101,14 +180,18 @@ type taskView struct {
 	MatchID     int64  `json:"matchId"`
 	NetworkSha  string `json:"networkSha"`
 	OpponentSha string `json:"opponentSha"`
-	Games       int    `json:"games"`
-	CreatedAt   int64  `json:"createdAt"`
+	// OpponentSpec eval 任务的对手标识（rule:capture_first 等）；其余任务为空。
+	OpponentSpec string `json:"opponentSpec"`
+	Games        int    `json:"games"`
+	CreatedAt    int64  `json:"createdAt"`
 }
 
 type controlRequest struct {
 	Paused          *bool   `json:"paused"`
 	InitialRevealed *int    `json:"initialRevealed"`
 	DataKind        *string `json:"dataKind"` // resnet / nnue
+	// ClearStop 清除绝对强度判据置位的停机信号（确认续训时使用）。
+	ClearStop *bool `json:"clearStop"`
 }
 
 func toNetworkView(n store.Network) networkView {
@@ -138,6 +221,9 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		MinClientVersion: rt.MinClientVersion,
 		Sprt:             sprtView{Elo0: rt.SprtElo0, Elo1: rt.SprtElo1, Alpha: rt.SprtAlpha, Beta: rt.SprtBeta},
 		Counts:           counts,
+		Eval:             toEvalConfigView(rt, s.sched.PendingEval()),
+		ShouldStop:       s.sched.Control().ShouldStop(),
+		StopReason:       s.sched.Control().StopReason(),
 	}
 	if best != nil {
 		nv := toNetworkView(*best)
@@ -271,10 +357,60 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	for _, t := range tasks {
 		out = append(out, taskView{
 			TaskID: t.TaskID, WorkerID: t.WorkerID, Kind: t.Kind.String(), MatchID: t.MatchID,
-			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha, Games: t.Games, CreatedAt: t.CreatedAt.Unix(),
+			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha, OpponentSpec: t.OpponentSpec,
+			Games: t.Games, CreatedAt: t.CreatedAt.Unix(),
 		})
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleEval 返回绝对强度评估的趋势视图：按对手分组的版本序列（升序）+ 最新明细 +
+// 「连续无提升」计数 + 评估配置。界面据此画曲线并显示停机信号。
+func (s *Server) handleEval(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	rt := s.sched.Runtime()
+
+	items, err := s.store.ListEvalResults(ctx, evalLatestLimit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	latest := make([]evalResultView, 0, len(items))
+	for _, e := range items {
+		latest = append(latest, toEvalResultView(e))
+	}
+
+	opponents, err := s.store.ListEvalOpponents(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	trends := make([]evalTrendView, 0, len(opponents))
+	for _, opp := range opponents {
+		points, err := s.store.EvalTrend(ctx, opp, evalTrendLimit)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		tv := evalTrendView{Opponent: opp, Points: make([]evalResultView, 0, len(points))}
+		for _, p := range points {
+			tv.Points = append(tv.Points, toEvalResultView(p))
+		}
+		if prog, ok := s.sched.EvalProgressFor(ctx, opp, 0); ok {
+			tv.Versions = prog.Versions
+			tv.NoProgress = prog.NoProgress
+			tv.LatestWinRate = prog.LatestWinRate
+		}
+		trends = append(trends, tv)
+	}
+
+	writeJSON(w, http.StatusOK, evalView{
+		Config:     toEvalConfigView(rt, s.sched.PendingEval()),
+		ShouldStop: s.sched.Control().ShouldStop(),
+		StopReason: s.sched.Control().StopReason(),
+		Latest:     latest,
+		Trends:     trends,
+	})
 }
 
 func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
@@ -308,6 +444,13 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("[webui] data_kind=%s", scheduler.DataKindName(kind))
+	}
+	if req.ClearStop != nil && *req.ClearStop {
+		if err := s.sched.Control().ClearStop(r.Context()); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		log.Printf("[webui] eval should_stop 已清除（确认续训）")
 	}
 	writeJSON(w, http.StatusOK, okView{OK: true})
 }

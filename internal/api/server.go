@@ -33,6 +33,7 @@ func New(st *store.Store, sched *scheduler.Server, onlineWindow time.Duration) *
 	mux.HandleFunc("GET /api/networks", s.handleNetworks)
 	mux.HandleFunc("POST /api/networks/{sha}/promote", s.handlePromote)
 	mux.HandleFunc("GET /api/matches", s.handleMatches)
+	mux.HandleFunc("GET /api/eval", s.handleEval)
 	mux.HandleFunc("GET /api/workers", s.handleWorkers)
 	mux.HandleFunc("GET /api/episodes", s.handleEpisodes)
 	mux.HandleFunc("GET /api/tasks", s.handleTasks)

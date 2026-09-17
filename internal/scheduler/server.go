@@ -38,6 +38,22 @@ type Config struct {
 	ReanalysisIntervalTasks int
 	// ReanalysisMaxQueue 待下发重搜任务的队列上限（按载荷条数，<=0 视为不限）。
 	ReanalysisMaxQueue int
+
+	// ---- 绝对强度评估（TASK_EVAL，见 eval.go）----
+	// EvalEnabled 是否启用评估：关闭时不下发任何 eval 任务（老 collector 未升级时先别开）。
+	EvalEnabled bool
+	// EvalOpponents 评估对手标识列表（random / rule:capture_first / rule:reveal_first）。
+	EvalOpponents []string
+	// EvalGames 每次评估的局数（一次任务即含全部局数，不做累加）。
+	EvalGames int
+	// EvalMctsSims 评估搜索深度：0 = 纯策略 argmax（门禁主口径），>0 = MCTS 模拟数。
+	EvalMctsSims int
+	// EvalEveryNPromotions 节流：每 N 次 best 晋级评测一次（<=0 视为 1）。
+	EvalEveryNPromotions int
+	// EvalNoProgressN 连续 N 次评测提升不足即置位 should_stop（<=0 关闭判停，只观测）。
+	EvalNoProgressN int
+	// EvalNoProgressEps 判定「有提升」的最小胜率增量（0.02 = 2pt，对齐 n=3000 时 2σ≈1.8pt）。
+	EvalNoProgressEps float64
 }
 
 // extraConfig 生成 SelfPlayParams.extra_config（JSON 透传）；无课程参数时为空串。
@@ -66,14 +82,17 @@ func (s *Server) gamesFor(threads int32) int32 {
 }
 
 type runningTask struct {
-	Kind        pb.TaskKind
-	MatchID     int64
-	NetworkSha  string
+	Kind       pb.TaskKind
+	MatchID    int64
+	NetworkSha string
+	// OpponentSha rating 任务的对手网络 sha；eval 任务恒为空（对手不是网络）。
 	OpponentSha string
-	Games       int
-	WorkerID    string
-	CreatedAt   time.Time
-	// Done 标记任务已上报结束（rating 用）：Done 后即释放 match 的在飞名额。
+	// OpponentSpec eval 任务的对手标识（rule:capture_first 等）；其余任务为空。
+	OpponentSpec string
+	Games        int
+	WorkerID     string
+	CreatedAt    time.Time
+	// Done 标记任务已上报结束（rating / eval 用）：Done 后即释放对应的在飞名额。
 	Done bool
 }
 
@@ -130,14 +149,15 @@ func (s *Server) pruneTasks(now time.Time) {
 
 // RunningTask 是进行中任务的只读快照（WebUI 展示用）。
 type RunningTask struct {
-	TaskID      string
-	WorkerID    string
-	Kind        pb.TaskKind
-	MatchID     int64
-	NetworkSha  string
-	OpponentSha string
-	Games       int
-	CreatedAt   time.Time
+	TaskID       string
+	WorkerID     string
+	Kind         pb.TaskKind
+	MatchID      int64
+	NetworkSha   string
+	OpponentSha  string
+	OpponentSpec string
+	Games        int
+	CreatedAt    time.Time
 }
 
 // Runtime 是调度器运行时配置快照（含 WebUI 可写项）。
@@ -151,6 +171,14 @@ type Runtime struct {
 	Paused           bool
 	InitialRevealed  int
 	DataKind         pb.DataKind
+	// 绝对强度评估（只读快照；判停信号见 ShouldStop/StopReason）
+	EvalEnabled          bool
+	EvalOpponents        []string
+	EvalGames            int
+	EvalMctsSims         int
+	EvalNoProgressN      int
+	EvalNoProgressEps    float64
+	EvalEveryNPromotions int
 }
 
 type Server struct {
@@ -168,6 +196,11 @@ type Server struct {
 	// 二者与 tasks 共用 s.mu 保护。
 	reanalysis              []*pendingReanalysis
 	reanalysisSinceSelfplay int
+
+	// 待下发的评估任务（best 晋级时入队，见 eval.go）与「已触发的晋级次数」（节流计数）。
+	// 同样与 tasks 共用 s.mu 保护。计数留内存：重启后节流相位重置可接受（评测本身幂等）。
+	evals          []*pendingEval
+	evalPromotions int
 }
 
 func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presigner) (*Server, error) {
@@ -175,7 +208,10 @@ func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presign
 	if err != nil {
 		return nil, fmt.Errorf("load control: %w", err)
 	}
-	return &Server{cfg: cfg, ctl: ctl, store: st, r2: presigner, tasks: make(map[string]*runningTask)}, nil
+	s := &Server{cfg: cfg, ctl: ctl, store: st, r2: presigner, tasks: make(map[string]*runningTask)}
+	// 启动补齐：当前 best 若有未评测的对手（新增评测配置 / 上次被中断）立即入队。
+	s.ensureBestEvaluated(ctx)
+	return s, nil
 }
 
 func (s *Server) Control() *Control { return s.ctl }
@@ -191,6 +227,14 @@ func (s *Server) Runtime() Runtime {
 		Paused:           s.ctl.Paused(),
 		InitialRevealed:  s.ctl.InitialRevealed(),
 		DataKind:         s.ctl.DataKind(),
+
+		EvalEnabled:          s.cfg.EvalEnabled,
+		EvalOpponents:        s.cfg.EvalOpponents,
+		EvalGames:            s.cfg.EvalGames,
+		EvalMctsSims:         s.cfg.EvalMctsSims,
+		EvalNoProgressN:      s.cfg.EvalNoProgressN,
+		EvalNoProgressEps:    s.cfg.EvalNoProgressEps,
+		EvalEveryNPromotions: s.cfg.EvalEveryNPromotions,
 	}
 }
 
@@ -204,7 +248,8 @@ func (s *Server) RunningTasks() []RunningTask {
 		}
 		out = append(out, RunningTask{
 			TaskID: id, WorkerID: t.WorkerID, Kind: t.Kind, MatchID: t.MatchID,
-			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha, Games: t.Games, CreatedAt: t.CreatedAt,
+			NetworkSha: t.NetworkSha, OpponentSha: t.OpponentSha,
+			OpponentSpec: t.OpponentSpec, Games: t.Games, CreatedAt: t.CreatedAt,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
@@ -229,8 +274,15 @@ func (s *Server) markTaskDone(taskID string) {
 }
 
 // GetInfo 下发调度器全局信息（trainer 启动时获取变体，worker 零配置）。
+//
+// 同时下发绝对强度的停机信号：trainer 按间隔轮询本接口，should_stop=true 时走既有
+// 优雅停止路径（先把当前轮训完并落 checkpoint 再退出）。
 func (s *Server) GetInfo(ctx context.Context, req *pb.GetInfoRequest) (*pb.GetInfoReply, error) {
-	return &pb.GetInfoReply{Variant: s.cfg.Variant}, nil
+	return &pb.GetInfoReply{
+		Variant:    s.cfg.Variant,
+		ShouldStop: s.ctl.ShouldStop(),
+		StopReason: s.ctl.StopReason(),
+	}, nil
 }
 
 // Heartbeat 记录 worker 状态并回传 best 网络与暂停标志。

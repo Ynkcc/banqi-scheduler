@@ -5,6 +5,7 @@ export interface Counts {
   episodes: number
   episodeGames: number
   workers: number
+  evalResults: number
 }
 
 export interface Network {
@@ -35,6 +36,54 @@ export interface Status {
   sprt: Sprt
   best: Network | null
   counts: Counts
+  eval: EvalConfig
+  /** 绝对强度判据置位的停机信号（trainer 轮询 GetInfo 后优雅停止） */
+  shouldStop: boolean
+  stopReason: string
+}
+
+/** 绝对强度评估配置快照 */
+export interface EvalConfig {
+  enabled: boolean
+  opponents: string[]
+  games: number
+  mctsSims: number
+  mode: string
+  everyNPromotions: number
+  noProgressN: number
+  noProgressEps: number
+  /** 待下发评估任务数 */
+  pending: number
+}
+
+/** 单次评估结果（被测网络 × 对手标识） */
+export interface EvalResult {
+  networkSha: string
+  opponentSpec: string
+  wins: number
+  draws: number
+  losses: number
+  numGames: number
+  winRate: number
+  avgMoves: number
+  createdAt: number
+}
+
+/** 单对手的版本序列（升序）与「连续无提升」计数 */
+export interface EvalTrend {
+  opponent: string
+  versions: number
+  noProgress: number
+  latestWinRate: number
+  points: EvalResult[]
+}
+
+export interface EvalView {
+  config: EvalConfig
+  shouldStop: boolean
+  stopReason: string
+  latest: EvalResult[]
+  trends: EvalTrend[]
 }
 
 export interface Match {
@@ -88,6 +137,8 @@ export interface RunningTask {
   matchId: number
   networkSha: string
   opponentSha: string
+  /** eval 任务的对手标识（rule:capture_first 等）；其余任务为空 */
+  opponentSpec: string
   games: number
   createdAt: number
 }

@@ -4,6 +4,7 @@
 //   - store.go    连接生命周期与建表迁移 + 跨表统计（Counts）+ 运行时设置
 //   - networks.go networks 表（best 指针 / 登记 / 状态）
 //   - matches.go  matches 表（gatekeeper 对打与五项成对计数）
+//   - eval.go     eval_results 表（绝对强度评估趋势，不参与晋级判定）
 //   - episodes.go episodes 表（元数据登记与游标分页）
 //   - workers.go  workers 表（心跳状态与版本）
 //
@@ -49,8 +50,8 @@ type Episode struct {
 	Winner     int
 	ObjectKey  string
 	// Kind 数据类别（pb.DataKind 的整数值：0=ResNet/MCTS，1=NNUE）。
-	Kind int
-	CreatedAt  time.Time
+	Kind      int
+	CreatedAt time.Time
 }
 
 type Worker struct {
@@ -69,6 +70,7 @@ type Counts struct {
 	Episodes       int `json:"episodes"`
 	EpisodeGames   int `json:"episodeGames"`
 	Workers        int `json:"workers"`
+	EvalResults    int `json:"evalResults"`
 }
 
 type Store struct {
@@ -114,6 +116,19 @@ func (s *Store) migrate(ctx context.Context) error {
 			num_games INTEGER NOT NULL DEFAULT 0,
 			target_games INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS eval_results (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			network_sha TEXT NOT NULL,
+			opponent_spec TEXT NOT NULL,
+			wins INTEGER NOT NULL DEFAULT 0,
+			draws INTEGER NOT NULL DEFAULT 0,
+			losses INTEGER NOT NULL DEFAULT 0,
+			num_games INTEGER NOT NULL DEFAULT 0,
+			avg_moves REAL NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			UNIQUE(network_sha, opponent_spec)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_eval_results_spec ON eval_results(opponent_spec, id)`,
 		`CREATE TABLE IF NOT EXISTS episodes (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			worker_id TEXT NOT NULL,
@@ -205,6 +220,7 @@ func (s *Store) Counts(ctx context.Context) (Counts, error) {
 		{`SELECT COUNT(*) FROM matches WHERE status='running'`, &c.MatchesRunning},
 		{`SELECT COUNT(*) FROM episodes`, &c.Episodes},
 		{`SELECT COUNT(*) FROM workers`, &c.Workers},
+		{`SELECT COUNT(*) FROM eval_results`, &c.EvalResults},
 	}
 	for _, t := range targets {
 		if err := s.db.QueryRowContext(ctx, t.query).Scan(t.dst); err != nil {

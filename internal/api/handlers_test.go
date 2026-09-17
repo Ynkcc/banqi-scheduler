@@ -17,6 +17,11 @@ import (
 
 func newTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
+	return newTestServerWithConfig(t, scheduler.Config{Variant: "4x8"})
+}
+
+func newTestServerWithConfig(t *testing.T, cfg scheduler.Config) (*Server, *store.Store) {
+	t.Helper()
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "scheduler.db"))
 	if err != nil {
@@ -27,7 +32,7 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	if err != nil {
 		t.Fatalf("r2: %v", err)
 	}
-	sched, err := scheduler.New(ctx, scheduler.Config{Variant: "4x8"}, st, presigner)
+	sched, err := scheduler.New(ctx, cfg, st, presigner)
 	if err != nil {
 		t.Fatalf("scheduler: %v", err)
 	}
@@ -132,5 +137,97 @@ func TestControlEndpoint(t *testing.T) {
 	// 非法 JSON → 400
 	if rec := do(t, s, http.MethodPost, "/api/control", `{`); rec.Code != http.StatusBadRequest {
 		t.Errorf("非法 JSON 应为 400, 实际 %d", rec.Code)
+	}
+}
+
+// 绝对强度面板的数据契约：配置、按对手分组的升序趋势、无提升计数、停机信号与清除。
+func TestEvalEndpointAndStopFlag(t *testing.T) {
+	ctx := context.Background()
+	s, st := newTestServerWithConfig(t, scheduler.Config{
+		Variant:           "4x8",
+		EvalEnabled:       true,
+		EvalOpponents:     []string{"random", "rule:capture_first"},
+		EvalGames:         1000,
+		EvalNoProgressN:   2,
+		EvalNoProgressEps: 0.02,
+	})
+
+	// 造三代停滞数据（60.0% → 60.5% → 60.8%，两次提升均 < 2pt）
+	for i, w := range []int{600, 605, 608} {
+		if err := st.UpsertEvalResult(ctx, store.EvalResult{
+			NetworkSha:   []string{"v1", "v2", "v3"}[i],
+			OpponentSpec: "rule:capture_first",
+			Wins:         w, Losses: 1000 - w, NumGames: 1000, AvgMoves: 44.4,
+			CreatedAt: time.Unix(int64(i+1), 0),
+		}); err != nil {
+			t.Fatalf("seed eval: %v", err)
+		}
+	}
+
+	rec := do(t, s, http.MethodGet, "/api/eval", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("eval status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var view map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+	cfg, _ := view["config"].(map[string]any)
+	if cfg == nil || cfg["enabled"] != true || cfg["mode"] != "纯策略 argmax" {
+		t.Errorf("config 视图不符: %+v", cfg)
+	}
+	latest, _ := view["latest"].([]any)
+	if len(latest) != 3 {
+		t.Errorf("latest 应有 3 条，实际 %d", len(latest))
+	}
+	trends, _ := view["trends"].([]any)
+	if len(trends) != 1 {
+		t.Fatalf("trends 应只含已评测的 1 个对手，实际 %d", len(trends))
+	}
+	tr, _ := trends[0].(map[string]any)
+	if tr["opponent"] != "rule:capture_first" {
+		t.Errorf("trend opponent = %v", tr["opponent"])
+	}
+	if tr["noProgress"] != float64(2) {
+		t.Errorf("noProgress = %v, want 2（两次提升均 < 2pt）", tr["noProgress"])
+	}
+	points, _ := tr["points"].([]any)
+	if len(points) != 3 {
+		t.Fatalf("趋势点应有 3 个，实际 %d", len(points))
+	}
+	first, _ := points[0].(map[string]any)
+	if first["networkSha"] != "v1" {
+		t.Errorf("趋势点应升序（老→新），首点 = %v", first["networkSha"])
+	}
+	if wr, _ := first["winRate"].(float64); wr < 0.5999 || wr > 0.6001 {
+		t.Errorf("首点胜率 = %v, want 0.6", wr)
+	}
+
+	// 未置位时不显示停机
+	if view["shouldStop"] != false {
+		t.Errorf("初始 shouldStop 应为 false，实际 %v", view["shouldStop"])
+	}
+
+	// 置位 → /api/status 与 /api/eval 都应暴露
+	if err := s.sched.Control().SetStop(ctx, "eval_no_progress: 测试"); err != nil {
+		t.Fatalf("SetStop: %v", err)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(do(t, s, http.MethodGet, "/api/status", "").Body.Bytes(), &status); err != nil {
+		t.Fatalf("status json: %v", err)
+	}
+	if status["shouldStop"] != true || status["stopReason"] != "eval_no_progress: 测试" {
+		t.Errorf("status 未暴露停机信号: shouldStop=%v reason=%v", status["shouldStop"], status["stopReason"])
+	}
+
+	// 通过 control 清除（确认续训）
+	if rec := do(t, s, http.MethodPost, "/api/control", `{"clearStop":true}`); rec.Code != http.StatusOK {
+		t.Fatalf("clearStop status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if err := json.Unmarshal(do(t, s, http.MethodGet, "/api/status", "").Body.Bytes(), &status); err != nil {
+		t.Fatalf("status json: %v", err)
+	}
+	if status["shouldStop"] != false || status["stopReason"] != "" {
+		t.Errorf("清除后应无停机信号，实际 shouldStop=%v reason=%v", status["shouldStop"], status["stopReason"])
 	}
 }

@@ -5,7 +5,9 @@
 
 ## 1. 定位
 
-分布式自对弈训练的中心调度器：任务分发（selfplay/rating）、网络登记与晋级、episode 元数据登记 + R2 预签名直传、五项 GSPRT 判停。
+分布式自对弈训练的中心调度器：任务分发（selfplay/rating/eval/reanalysis）、网络登记与晋级、episode 元数据登记 + R2 预签名直传、五项 GSPRT 判停、**绝对强度评估与停机判据**。
+
+> **两类门禁的分工**：gatekeeper（GSPRT）是**相对**门禁，只回答「这代比上代强吗」，结构上测不出「所有版本都打不过一个 3 行的优先吃子启发式」；`TASK_EVAL` 是**绝对**强度观测（best vs 规则/内建对手），用于发现后一类问题（见 §3.2）。
 
 调研结论（主仓库 `docs/distributed_training_reference_survey.md`）落地：lczero 拉取式调度 + KataGo URL 下发/预签名直传 + fishtest/pentanomial 五项 GSPRT 判停。
 技术栈：Go + grpc-go + SQLite（modernc 纯 Go 驱动，WAL）+ aws-sdk-go-v2 S3 预签名（R2 兼容，凭据走标准 `AWS_*` 环境变量）。
@@ -16,10 +18,10 @@
 |---|---|
 | `go.mod` | module `banqi/server` |
 | `cmd/scheduler/main.go` | 入口：`run()` 编排生命周期（`signal.NotifyContext` → `GracefulStop` + WebUI `Shutdown`），配置全走 `SCHEDULER_*` 环境变量（`-h` 列出）；示例配置见 `config.example.env`（含 R2 凭据与 GSPRT 参数说明）。另读标准 `AWS_*` 凭据/endpoint，`AWS_S3_PATH_STYLE=1` 时改用 path-style 寻址（本地 RustFS / MinIO 必需，R2 默认不设） |
-| `internal/store` | SQLite 元数据，全部方法以 `context` 为首参；文件按表拆分：`store.go`（连接/迁移/统计/设置）、`networks.go`、`matches.go`、`episodes.go`、`workers.go`；迁移用 `pragma_table_info` 探测列存在性，best 指针事务切换 |
+| `internal/store` | SQLite 元数据，全部方法以 `context` 为首参；文件按表拆分：`store.go`（连接/迁移/统计/设置）、`networks.go`、`matches.go`、`eval.go`（绝对强度评估结果与趋势，**无外键**——规则对手没有 networks 行）、`episodes.go`、`workers.go`；迁移用 `pragma_table_info` 探测列存在性，best 指针事务切换 |
 | `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.epb.gz`（EpisodeBatch 二进制记录）、`networks/<sha>.<format>`（扩展名 = 权重格式 onnx/pt/nnue，worker 据此分派加载器） |
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
-| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask，下发 `network_key`/`opponent_key`）、`networks.go`（登记/晋级/gatekeeper 判停 + 权重格式白名单校验）、`episodes.go`（episode 登记与 trainer 数据面）、`reanalysis.go`（局面重搜任务队列：SubmitReanalysis 入队 + 按间隔节流下发）、`control.go`（运行时控制，落库 settings） |
+| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask，下发 `network_key`/`opponent_key`）、`networks.go`（登记/晋级/gatekeeper 判停 + 权重格式白名单校验）、`episodes.go`（episode 登记与 trainer 数据面）、`reanalysis.go`（局面重搜任务队列：SubmitReanalysis 入队 + 按间隔节流下发）、`eval.go`（绝对强度评估编排：晋级触发/TASK_EVAL 下发/结果落库/「连续 N 次无提升」判据与停机置位）、`control.go`（运行时控制 + 停机信号，落库 settings） |
 | `internal/api` | WebUI 的 JSON API + 控制端点 + embed 前端产物（`HTTPServer(addr)` 交由调用方启停，同进程 http.Server） |
 | `webui/` | React 18 + Vite + TS + AntD 前端源码，构建产物输出到 `internal/api/dist` |
 | `pb/` | protoc 生成代码（不提交） |
@@ -27,15 +29,15 @@
 
 ## 3. gRPC 契约（scheduler.proto，10 RPC）
 
-- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次**局面重搜 reanalysis**（按间隔节流，见 §4.1），再次 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；selfplay 另经 `SelfPlayParams.data_kind` 下发**数据类别**（`SCHEDULER_DATA_KIND` / WebUI，见 `DataKind`），worker 据此产出对应类别的记录；`TASK_REANALYSIS` 任务经 `reanalysis_payload` 下发历史局面载荷（恒用 `DATA_RESNET`，与 selfplay 的类别切换无关），其 `games` 字段表示位置条数；
+- `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次**绝对强度评估 TASK_EVAL**（见 §3.2），再次**局面重搜 reanalysis**（按间隔节流，见 §3.1），最后 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；selfplay 另经 `SelfPlayParams.data_kind` 下发**数据类别**（`SCHEDULER_DATA_KIND` / WebUI，见 `DataKind`），worker 据此产出对应类别的记录；`TASK_REANALYSIS` 任务经 `reanalysis_payload` 下发历史局面载荷（恒用 `DATA_RESNET`，与 selfplay 的类别切换无关），其 `games` 字段表示位置条数；
 - `ReportEpisode`：只收元数据（含数据类别 `kind`，落库 `episodes.kind`），签发 R2 预签名 PUT（对象键 `episodes/<sha>/<id>.epb.gz`），数据直传 R2（校验 task↔worker 归属）；
 - `GetNetwork`：sha 或 best → 对象键 + 预签名 GET；
 - `RegisterNetwork`：trainer 登记新网络（含权重格式 `format`，落库 `networks.format`）→ 自动创建 gatekeeper 对打；首个网络直接晋级；格式不在白名单（onnx/pt/nnue）时拒绝登记；
-- `ReportMatchResult`：五项成对计数累计 → GSPRT 判停 → 晋级/拒绝 best 指针；
+- `ReportMatchResult`：rating 分支累计五项成对计数 → GSPRT 判停 → 晋级/拒绝 best 指针；`TASK_EVAL` 分支只落 `eval_results` 并更新停机判据（**不参与 GSPRT 与晋级**，见 §3.2）；
 - `Heartbeat`：worker 状态（client_version/memory_mb/running_task_id）+ best sha 下发；
 - `SignNetworkUpload`：trainer 请求网络直传预签名 PUT（须声明权重格式 `format`，对象键 `networks/<sha>.<format>`）；
 - `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；可带 `kind` 只取某一数据类别（缺省不过滤），消费方据此避免下载无法消费的对象；
-- `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）；
+- `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）与 **`should_stop` / `stop_reason`**（绝对强度判据置位的停机信号，trainer 按 `SHOULD_STOP_POLL_SECONDS` 轮询后优雅停止，见 §3.2）；
 - `SubmitReanalysis`：trainer 提交一批**待重搜局面**（异步：入队后由 `GetTask` 分发给任意 worker）。拒绝情形：未启用（`SCHEDULER_REANALYSIS_INTERVAL_TASKS=0`）、变体与服务端不一致（防串变体）、载荷为空、队列满（不丢已有条目）。
 
 **安全约定**：R2 凭据只在调度器持有，worker/trainer 零存储配置，全部经预签名 URL 上下行。
@@ -45,6 +47,28 @@
 trainer 从历史 episode 里攒下带胜负的**局面快照**（`EpisodeRecord.positions`），经 `SubmitReanalysis` 入队；`GetTask` 在 rating 之后、selfplay 之前按**间隔节流**取一条下发：每 `SCHEDULER_REANALYSIS_INTERVAL_TASKS` 个 selfplay 任务最多下发 1 个重搜任务（重搜与自对弈争抢同一份算力，间隔是这两类工作的配比旋钮；0 = 关闭）。队列上限 `SCHEDULER_REANALYSIS_MAX_QUEUE`（按载荷条数）满了拒绝新提交 —— 不按 FIFO 丢弃，因为最旧的位置恰恰是重搜收益最大的。
 
 组装（拉 best / 签发 URL）失败时**不消费队首**，等下次 `GetTask` 重试，避免丢掉 trainer 提交的数据。重搜产出的数据走常规 `ReportEpisode` 通道（`DATA_RESNET`），训练侧零改动即可消费。
+
+### 3.2 绝对强度评估（eval）任务与停机判据
+
+**动机**：gatekeeper 是相对门禁（candidate vs 当前 best + GSPRT），只比较相邻两代。历史事故：380 个版本一路晋级，而同一模型的纯策略对「优先吃子」这个 3 行启发式只有 57.6% —— 相对门禁结构上不可能发现这类问题。
+
+**执行位置**：调度器（Go）没有棋引擎，只负责编排；实际对局由采集端（Rust）执行，因此评估被建模为一种新任务 `TASK_EVAL`，复用 «下发任务 → worker 执行 → 上报结果 → 服务端聚合» 主链路。
+
+**编排**（`internal/scheduler/eval.go`）：
+
+| 环节 | 行为 |
+|---|---|
+| 触发 | best 指针变更时（`RegisterNetwork` 首个网络晋级 / `ReportMatchResult` 晋级）按 `SCHEDULER_EVAL_EVERY_N_PROMOTIONS` 节流入队（每对手一条）；启动时补齐当前 best 缺失的对手（新增配置 / 上次中断） |
+| 下发 | `TaskResponse.opponent_spec` 携带对手标识（`random` / `rule:capture_first` / `rule:reveal_first`）；规则对手无网络文件，故不签发 `opponent_key`/`opponent_url`。**一次任务即含全部局数**（`SCHEDULER_EVAL_GAMES`，不做累加），因此重下发只是重做同一件事，结果按 `(network_sha, opponent_spec)` 覆盖，天然幂等 |
+| 模式 | `SelfPlayParams.mcts_sims`：0 = 纯策略 argmax（门禁主口径），>0 = MCTS 模拟数 |
+| 在飞保护 | `(network, spec)` 同刻只允许一个在飞任务；超过 `evalTaskStaleAfter`(15m) 未上报视为失效可重下发；队首连续 `evalMaxAttempts`(3) 次下发未上报即**丢弃并告警**（旧版 collector 不认 `TASK_EVAL` 时会安全降级为「无任务」，若不丢弃会把自对弈饿死） |
+| 落库 | `eval_results` 表（**无外键**：规则对手不存在 networks 行，与 `matches` 表刻意分离）；`UNIQUE(network_sha, opponent_spec)` 保证同版本复测覆盖而不产生重复点；上报局数少于已有行时忽略（部分结果不劣化完整结果） |
+| 判据 | 同一对手的胜率序列上，连续 `SCHEDULER_EVAL_NO_PROGRESS_N` 次「提升 < `SCHEDULER_EVAL_NO_PROGRESS_EPS`」→ `Control.SetStop(reason)`（落库 settings，跨重启保留）。**不设绝对阈值**（用户口径：只看趋势）。`N=0` = 只观测不判停 |
+| 停机 | `GetInfoReply.should_stop/stop_reason` 下发；trainer 按 `SHOULD_STOP_POLL_SECONDS` 轮询，命中后走**既有**优雅停止路径（先训完当前轮并落 checkpoint）。清除需显式操作（`POST /api/control {"clearStop":true}`），避免「重启即绕过判据」 |
+
+**算力与数据边界**：评估任务排在 rating 之后、reanalysis/selfplay 之前（单批完成、纯策略 1000 局秒级），受在飞保护与次数上限约束；`record_episodes=false`，**不产 episode、不上传对象**，不会污染训练数据。
+
+**对手标识**（与采集端 `rule_opponents.rs` 同一套）：`random` / `rule:capture_first` / `rule:reveal_first`。启动时校验，写错即失败（`ValidateEvalOpponents`）。若将来引入 expectimax/NNUE 对手，只需扩展采集端解析与 `ValidateEvalOpponents`。
 
 ## 4. proto 生成
 
@@ -68,9 +92,10 @@ go build ./cmd/scheduler
 
 | 路由 | 说明 |
 |---|---|
-| `GET /api/status` | 变体、课程阶段、暂停状态、SPRT 参数、best、计数 |
+| `GET /api/status` | 变体、课程阶段、暂停状态、SPRT 参数、best、计数、评估配置、**`shouldStop`/`stopReason`** |
 | `GET /api/networks` | 网络列表（best 优先） |
 | `GET /api/matches` | 对战列表，附 LLR / 得分率 / 判停结果 |
+| `GET /api/eval` | 绝对强度趋势：评估配置 + 按对手分组的版本序列（升序）+ 最新明细 + 「连续无提升」计数 + 停机信号 |
 | `GET /api/workers` | Worker 列表与在线判定（`SCHEDULER_WORKER_ONLINE_SECONDS`，默认 60s） |
 | `GET /api/episodes?before=&limit=` | episode 元数据按 id 倒序分页 |
 | `GET /api/tasks` | 进程内进行中任务快照 |
@@ -80,7 +105,9 @@ go build ./cmd/scheduler
 | 路由 | 说明 |
 |---|---|
 | `POST /api/networks/{sha}/promote` | 手动晋级 best |
-| `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发；`{"dataKind":"resnet"\|"nnue"}` 在线切换自对弈产出的数据类别，经 `SelfPlayParams.data_kind` 下发 |
+| `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发；`{"dataKind":"resnet"\|"nnue"}` 在线切换自对弈产出的数据类别，经 `SelfPlayParams.data_kind` 下发；`{"clearStop":true}` 清除绝对强度判据置位的停机信号（确认续训） |
+
+前端页面：总览 / 网络 / 对战·SPRT / **绝对强度** / Worker / Episode。「绝对强度」页展示停机横幅（含一键清除）、评估配置、按对手的版本趋势（含零依赖 SVG 迷你趋势图）与评估明细。
 
 内存任务表保留策略（见 `internal/scheduler/server.go`）：tasks 仅用于 task↔worker 归属校验与 rating 在飞判定，进度以 DB 为准；已上报结束（`Done`）的记录保留 `doneTaskRetention`(30m)、未上报记录最多保留 `taskMaxRetention`(24h)，由 `pruneTasks` 在 `GetTask` 路径上按 `pruneInterval`(1m) 节流回收；`/api/tasks` 只展示未结束任务。
 
@@ -111,3 +138,9 @@ go build ./cmd/scheduler
   - **下发内容**：`NetworkSha` = 当前 best（重搜的意义就是更强的网络重搜旧局面）、`NetworkKey/Url` 与 selfplay 同规则、`games` = 位置条数、`Params.data_kind` 恒为 `DATA_RESNET`（重搜基于 MCTS，与 selfplay 的类别切换无关）、`Params.mcts_sims` 取提交方指定值（0 = worker 默认）。
   - **回收链路复用**：重搜产物由 worker 经常规 `ReportEpisode` 上报（一局面一条 1 样本 episode），训练侧零改动即可消费。
   - **测试**：新增 `internal/scheduler/reanalysis_test.go`（提交入口三条拒绝路径 + 队列节流 / peek 不消费 / commit 重置计数 / 上限拒绝）。
+- 2026-09-17：**新增绝对强度评估（TASK_EVAL）与停机判据**（`SCHEDULER_EVAL_*`）：
+  - **proto**：`TaskKind` 新增 `TASK_EVAL`；`TaskResponse` 新增 `opponent_spec`（14）、`MatchResult` 新增 `opponent_spec`（15）与 `avg_moves`（16）、`GetInfoReply` 新增 `should_stop`（2）/`stop_reason`（3）。RPC 数量不变（10）；三份 proto 副本已同步。
+  - **落库**：新增 `eval_results` 表（**无外键**，`UNIQUE(network_sha, opponent_spec)`），新增 `Counts.evalResults`；迁移沿用 `CREATE TABLE IF NOT EXISTS`，老库自动补表。
+  - **编排**（`internal/scheduler/eval.go`）：best 晋级触发（按 `SCHEDULER_EVAL_EVERY_N_PROMOTIONS` 节流）+ 启动补齐；一次任务含全部局数；`(network,spec)` 在飞保护与 15m 失效判定；队首连续 3 次下发未上报即丢弃（防旧版 worker 饿死自对弈）；`reportEvalResult` 只落库不参与晋级，且部分结果不劣化完整结果；`judgeEvalProgress` 按「连续 N 次提升 < EPS」置位 `Control.SetStop`（落库 settings，跨重启保留，需显式 `clearStop`）。
+  - **API/UI**：新增 `GET /api/eval`；`/api/status` 增加 `eval` 配置与 `shouldStop`/`stopReason`；`/api/control` 支持 `clearStop`；WebUI 新增「绝对强度」页。
+  - **测试**：新增 `internal/store/eval_test.go`（去重覆盖 / 趋势序列 / 老库补表）、`internal/scheduler/eval_test.go`（节流去重 / 在飞 / 丢弃 / 判据 / 部分结果保护 / 进程内全链路）、`internal/api` 增补 `/api/eval` 与停机信号用例。

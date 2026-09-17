@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +40,15 @@ type config struct {
 	workerOnlineSeconds     int
 	reanalysisIntervalTasks int
 	reanalysisMaxQueue      int
+
+	// 绝对强度评估（TASK_EVAL）
+	evalEnabled          bool
+	evalOpponents        []string
+	evalGames            int
+	evalMctsSims         int
+	evalEveryNPromotions int
+	evalNoProgressN      int
+	evalNoProgressEps    float64
 }
 
 func loadConfig() config {
@@ -61,6 +71,22 @@ func loadConfig() config {
 		// 0 = 关闭局面重搜（trainer 提交会被拒绝，队列不积累）
 		reanalysisIntervalTasks: envInt("SCHEDULER_REANALYSIS_INTERVAL_TASKS", 0),
 		reanalysisMaxQueue:      envInt("SCHEDULER_REANALYSIS_MAX_QUEUE", 64),
+
+		// 绝对强度评估（TASK_EVAL）：默认关闭 —— 旧版 collector 不认识该任务类型，
+		// 升级 collector 后再开启（否则 eval 任务无人可做、只会白占队列）。
+		evalEnabled:   envBool("SCHEDULER_EVAL_ENABLED", false),
+		evalOpponents: envList("SCHEDULER_EVAL_OPPONENTS", scheduler.DefaultEvalOpponents),
+		evalGames:     envInt("SCHEDULER_EVAL_GAMES", 1000),
+		// 0 = 纯策略 argmax（门禁主口径）
+		evalMctsSims:         envInt("SCHEDULER_EVAL_MCTS_SIMS", 0),
+		evalEveryNPromotions: envInt("SCHEDULER_EVAL_EVERY_N_PROMOTIONS", 1),
+		// 连续 N 次提升不足即置位 should_stop；0 = 关闭判停（只观测趋势）
+		evalNoProgressN: envInt("SCHEDULER_EVAL_NO_PROGRESS_N", 3),
+		// 有提升的最小胜率增量：2pt（对齐 n=3000 时 2σ≈1.8pt）
+		evalNoProgressEps: envFloat("SCHEDULER_EVAL_NO_PROGRESS_EPS", 0.02),
+	}
+	if err := scheduler.ValidateEvalOpponents(c.evalOpponents); err != nil {
+		log.Fatalf("[config] %v", err)
 	}
 	kind, err := scheduler.ParseDataKind(envOr("SCHEDULER_DATA_KIND", "resnet"))
 	if err != nil {
@@ -97,6 +123,34 @@ func envFloat(key string, def float64) float64 {
 	return def
 }
 
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(strings.TrimSpace(v)); err == nil {
+			return b
+		}
+		log.Printf("[config] invalid bool %s=%q, using %v", key, v, def)
+	}
+	return def
+}
+
+// envList 解析逗号分隔列表；未设置或全为空项时返回默认值。
+func envList(key string, def []string) []string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return def
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return def
+	}
+	return out
+}
+
 func main() {
 	if err := run(); err != nil {
 		log.Fatalf("scheduler: %v", err)
@@ -117,6 +171,10 @@ func run() error {
 			"SCHEDULER_INITIAL_REVEALED, SCHEDULER_DATA_KIND (resnet|nnue),",
 			"SCHEDULER_SPRT_ELO0, SCHEDULER_SPRT_ELO1, SCHEDULER_SPRT_ALPHA, SCHEDULER_SPRT_BETA,",
 			"SCHEDULER_MIN_CLIENT_VERSION, SCHEDULER_HTTP_ADDR, SCHEDULER_WORKER_ONLINE_SECONDS,",
+			"SCHEDULER_REANALYSIS_INTERVAL_TASKS, SCHEDULER_REANALYSIS_MAX_QUEUE,",
+			"SCHEDULER_EVAL_ENABLED, SCHEDULER_EVAL_OPPONENTS, SCHEDULER_EVAL_GAMES,",
+			"SCHEDULER_EVAL_MCTS_SIMS, SCHEDULER_EVAL_EVERY_N_PROMOTIONS,",
+			"SCHEDULER_EVAL_NO_PROGRESS_N, SCHEDULER_EVAL_NO_PROGRESS_EPS,",
 			"AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, AWS_S3_PATH_STYLE")
 		return nil
 	}
@@ -151,6 +209,14 @@ func run() error {
 
 		ReanalysisIntervalTasks: cfg.reanalysisIntervalTasks,
 		ReanalysisMaxQueue:      cfg.reanalysisMaxQueue,
+
+		EvalEnabled:          cfg.evalEnabled,
+		EvalOpponents:        cfg.evalOpponents,
+		EvalGames:            cfg.evalGames,
+		EvalMctsSims:         cfg.evalMctsSims,
+		EvalEveryNPromotions: cfg.evalEveryNPromotions,
+		EvalNoProgressN:      cfg.evalNoProgressN,
+		EvalNoProgressEps:    cfg.evalNoProgressEps,
 	}, st, presigner)
 	if err != nil {
 		return fmt.Errorf("scheduler: %w", err)
@@ -176,6 +242,16 @@ func run() error {
 	pb.RegisterSchedulerServiceServer(grpcServer, srv)
 	log.Printf("[scheduler] listening on %s db=%s bucket=%s sprt(elo0=%g,elo1=%g,alpha=%g,beta=%g)",
 		cfg.listen, cfg.sqlitePath, cfg.r2Bucket, cfg.elo0, cfg.elo1, cfg.alpha, cfg.beta)
+	if cfg.evalEnabled {
+		mode := "纯策略 argmax"
+		if cfg.evalMctsSims > 0 {
+			mode = fmt.Sprintf("MCTS %d sims", cfg.evalMctsSims)
+		}
+		log.Printf("[eval] enabled opponents=%v games=%d mode=%s every=%d_promotions no_progress=%d eps=%.3f",
+			cfg.evalOpponents, cfg.evalGames, mode, cfg.evalEveryNPromotions, cfg.evalNoProgressN, cfg.evalNoProgressEps)
+	} else {
+		log.Printf("[eval] disabled（SCHEDULER_EVAL_ENABLED=false）")
+	}
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- grpcServer.Serve(lis) }()

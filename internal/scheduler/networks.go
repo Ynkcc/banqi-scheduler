@@ -76,6 +76,7 @@ func (s *Server) RegisterNetwork(ctx context.Context, req *pb.RegisterNetworkReq
 			return nil, fmt.Errorf("promote first network %s: %w", req.Sha, err)
 		}
 		log.Printf("[network] first network promoted sha=%s", req.Sha)
+		s.onNewBest(ctx, req.Sha)
 		return &pb.RegisterNetworkAck{Accepted: true, Message: "first_network_promoted"}, nil
 	}
 	matchID, err := s.store.CreateMatch(ctx, req.Sha, best.Sha, s.cfg.GatekeeperGames)
@@ -95,6 +96,12 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 	}
 	if task.WorkerID != req.WorkerId {
 		return &pb.MatchResultAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
+	}
+	// 评估任务：只落 eval_results 并更新「无提升」判据，不参与 GSPRT 与晋级（见 eval.go）。
+	// 收尾（移出队列 + 释放在飞认领）由 reportEvalResult 同锁完成，此处不提前 markTaskDone:
+	// 提前释放会留下「不在飞但仍在队列」的窗口，导致同一 (network, spec) 被重复下发。
+	if task.Kind == pb.TaskKind_TASK_EVAL {
+		return s.reportEvalResult(ctx, task, req)
 	}
 	if task.Kind != pb.TaskKind_TASK_RATING {
 		return &pb.MatchResultAck{Accepted: false, Message: "task_is_not_rating"}, nil
@@ -141,6 +148,8 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 		}
 		promoted = true
 		bestSha = m.Candidate
+		// 新 best 入队绝对强度评估（按 EvalEveryNPromotions 节流；见 eval.go）
+		s.onNewBest(ctx, m.Candidate)
 	} else if verdict == sprt.RejectH0 {
 		status = "concluded"
 		if err := s.store.UpdateNetworkStatus(ctx, m.Candidate, "rejected"); err != nil {

@@ -21,7 +21,8 @@ func newID() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// GetTask 按「未完结 gatekeeper 对打优先、其次 best 网络 selfplay」下发任务。
+// GetTask 按优先级下发任务：
+// 未完结 gatekeeper 对打 > 绝对强度评估（TASK_EVAL）> 局面重搜 > best 网络 selfplay。
 func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResponse, error) {
 	s.pruneTasks(time.Now())
 
@@ -54,6 +55,23 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 
 	if s.ctl.Paused() {
 		return &pb.TaskResponse{Kind: pb.TaskKind_TASK_NONE, Message: "self_play_paused"}, nil
+	}
+
+	// 绝对强度评估（TASK_EVAL）：best vs 规则/内建对手，只落库、不参与晋级（见 eval.go）。
+	// 放在重搜与自对弈之前：单批即含全部局数、成本低（纯策略 1000 局秒级），越早拿到趋势
+	// 越能及早发现「练了很久却没变强」——这正是相对门禁结构上测不出来的东西。
+	// 受 EvalEnabled / (network,spec) 在飞保护 / 下发次数上限约束；认领是原子的（见 claimEvalTask）。
+	if job, taskID := s.claimEvalTask(req.WorkerId); job != nil {
+		resp, err := s.evalTask(ctx, taskID, job, req)
+		if err != nil {
+			// 组装失败（如网络已被清理）：释放本次认领，队列保留待下轮重试
+			s.releaseEvalClaim(taskID)
+			log.Printf("[eval] 本次无法下发（%v），已释放认领待重试", err)
+		} else {
+			log.Printf("[task] eval assigned worker=%s task=%s network=%s opponent=%s games=%d mode=%s",
+				req.WorkerId, taskID, resp.NetworkSha, job.Spec, resp.Games, s.evalModeName())
+			return resp, nil
+		}
 	}
 
 	// 局面重搜（reanalysis）：按间隔节流下发，与自对弈共享算力（见 reanalysis.go）。
