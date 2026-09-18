@@ -181,12 +181,19 @@ type Runtime struct {
 	EvalEveryNPromotions int
 }
 
+// Presigner 接口（r2.Presigner 满足；测试可注入 fake）。预签名 PUT/GET 是副作用
+// 通道（HTTP 出向），用接口抽象便于在不动 AWS SDK 的前提下做幂等/契约测试。
+type Presigner interface {
+	PresignPut(ctx context.Context, key string, length int64) (string, error)
+	PresignGet(ctx context.Context, key string) (string, error)
+}
+
 type Server struct {
 	pb.UnimplementedSchedulerServiceServer
 	cfg   Config
 	ctl   *Control
 	store *store.Store
-	r2    *r2.Presigner
+	r2    Presigner
 
 	mu        sync.Mutex
 	tasks     map[string]*runningTask
@@ -209,6 +216,12 @@ func New(ctx context.Context, cfg Config, st *store.Store, presigner *r2.Presign
 		return nil, fmt.Errorf("load control: %w", err)
 	}
 	s := &Server{cfg: cfg, ctl: ctl, store: st, r2: presigner, tasks: make(map[string]*runningTask)}
+	// 启动恢复：把上次进程退出时尚未收尾的 eval 待办从 DB 拉回内存。
+	// 否则重启会丢失「同一 best 的部分评测」，且与 ensureBestEvaluated 补齐逻辑
+	// 重叠后可能造成 (best, spec) 同时存在「in-flight」与「queued」的歧义。
+	if err := s.loadEvalQueue(ctx); err != nil {
+		return nil, fmt.Errorf("load eval queue: %w", err)
+	}
 	// 启动补齐：当前 best 若有未评测的对手（新增评测配置 / 上次被中断）立即入队。
 	s.ensureBestEvaluated(ctx)
 	return s, nil
@@ -283,6 +296,17 @@ func (s *Server) GetInfo(ctx context.Context, req *pb.GetInfoRequest) (*pb.GetIn
 		ShouldStop: s.ctl.ShouldStop(),
 		StopReason: s.ctl.StopReason(),
 	}, nil
+}
+
+// GetTrainConfig 下发运行时可调训练配置（trainer 启动 bootstrap + 运行中热更）。
+// 变体不符时拒绝：不同变体的超参与目标语义不同，误下发会静默污染实验。
+func (s *Server) GetTrainConfig(ctx context.Context, req *pb.GetTrainConfigRequest) (*pb.GetTrainConfigReply, error) {
+	if req.Variant != s.cfg.Variant {
+		return &pb.GetTrainConfigReply{
+			Message: fmt.Sprintf("变体不符：请求 %q，服务端 %q", req.Variant, s.cfg.Variant),
+		}, nil
+	}
+	return &pb.GetTrainConfigReply{Accepted: true, Overrides: s.ctl.TrainConfig()}, nil
 }
 
 // Heartbeat 记录 worker 状态并回传 best 网络与暂停标志。

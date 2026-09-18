@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 )
@@ -51,6 +52,29 @@ func (s *Store) InsertEpisode(ctx context.Context, e Episode) error {
 		return fmt.Errorf("insert episode worker=%s task=%s: %w", e.WorkerID, e.TaskID, err)
 	}
 	return nil
+}
+
+// GetEpisodeByTask 取指定 task_id 已登记的 episode 元数据（ReportEpisode 幂等闸口）。
+// 不存在时返回 (nil, nil)；多条并存（理论上 UNIQUE(task_id) 不允许）取最新一条。
+//
+// task_id 重复通常意味着 worker 在 R2 PUT 失败/超时后重试 ReportEpisode，此时应当
+// 返回首次登记的对象键与一份新签名的 PUT URL——worker 可以原对象键继续上传，无需
+// 重新分配 R2 路径。
+func (s *Store) GetEpisodeByTask(ctx context.Context, taskID string) (*Episode, error) {
+	var e Episode
+	var createdAt int64
+	err := s.db.QueryRowContext(ctx, `SELECT id, worker_id, task_id, network_sha, game_count, total_steps, winner, object_key, created_at, kind
+		FROM episodes WHERE task_id = ? ORDER BY id DESC LIMIT 1`, taskID).
+		Scan(&e.ID, &e.WorkerID, &e.TaskID, &e.NetworkSha, &e.GameCount,
+			&e.TotalSteps, &e.Winner, &e.ObjectKey, &createdAt, &e.Kind)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get episode by task %s: %w", taskID, err)
+	}
+	e.CreatedAt = time.Unix(createdAt, 0)
+	return &e, nil
 }
 
 // ListEpisodes 按 id 倒序分页（beforeID<=0 表示取最新一页）。

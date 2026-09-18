@@ -66,7 +66,7 @@ func loadConfig() config {
 		alpha:               envFloat("SCHEDULER_SPRT_ALPHA", 0.05),
 		beta:                envFloat("SCHEDULER_SPRT_BETA", 0.05),
 		minClientVersion:    os.Getenv("SCHEDULER_MIN_CLIENT_VERSION"),
-		httpAddr:            envOr("SCHEDULER_HTTP_ADDR", "127.0.0.1:8080"),
+		httpAddr:            envOr("SCHEDULER_HTTP_ADDR", "127.0.0.1:9536"),
 		workerOnlineSeconds: envInt("SCHEDULER_WORKER_ONLINE_SECONDS", 60),
 		// 0 = 关闭局面重搜（trainer 提交会被拒绝，队列不积累）
 		reanalysisIntervalTasks: envInt("SCHEDULER_REANALYSIS_INTERVAL_TASKS", 0),

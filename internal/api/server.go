@@ -38,6 +38,8 @@ func New(st *store.Store, sched *scheduler.Server, onlineWindow time.Duration) *
 	mux.HandleFunc("GET /api/episodes", s.handleEpisodes)
 	mux.HandleFunc("GET /api/tasks", s.handleTasks)
 	mux.HandleFunc("POST /api/control", s.handleControl)
+	mux.HandleFunc("GET /api/train-config", s.handleTrainConfigGet)
+	mux.HandleFunc("PUT /api/train-config", s.handleTrainConfigPut)
 	mux.HandleFunc("/", s.handleStatic)
 	s.handler = mux
 	return s

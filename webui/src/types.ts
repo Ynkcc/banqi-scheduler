@@ -130,6 +130,26 @@ export interface EpisodePage {
   hasMore: boolean
 }
 
+/** 可远程调节的训练超参类型（与调度器 trainConfigSpecs 的 kind 对应） */
+export type TrainConfigKind = 'float' | 'int' | 'bool' | 'enum'
+
+/** 白名单字段描述：前端据此渲染表单与约束提示，无需硬编码字段名与取值范围 */
+export interface TrainConfigField {
+  name: string
+  kind: TrainConfigKind
+  min: number
+  max: number
+  hasMax: boolean
+  gtZero: boolean
+  enum?: string[]
+}
+
+/** 训练超参面板视图：当前覆盖项（全量语义）+ 可调字段清单 */
+export interface TrainConfigView {
+  overrides: Record<string, string>
+  fields: TrainConfigField[]
+}
+
 export interface RunningTask {
   taskId: string
   workerId: string

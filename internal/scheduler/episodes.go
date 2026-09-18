@@ -12,6 +12,10 @@ import (
 )
 
 // ReportEpisode 登记 episode 元数据并签发 R2 预签名 PUT（数据由 worker 直传）。
+//
+// 幂等：同 task_id 重复上报返回首次登记的对象键与一份新签名的 PUT URL——worker 可用
+// 原对象键继续上传而不必重新分配 R2 路径（避免产生孤儿对象）。底层由 episodes.task_id
+// 唯一索引兜底（数据已有重复 task_id 时降级为应用层查重，启动时打告警）。
 func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.EpisodeAck, error) {
 	task, ok := s.lookupTask(req.TaskId)
 	if !ok {
@@ -22,6 +26,17 @@ func (s *Server) ReportEpisode(ctx context.Context, req *pb.EpisodeMeta) (*pb.Ep
 	}
 	if task.NetworkSha != req.NetworkSha {
 		return &pb.EpisodeAck{Accepted: false, Message: fmt.Sprintf("network_sha_mismatch task=%s got=%s", task.NetworkSha, req.NetworkSha)}, nil
+	}
+	// 幂等闸口：同 task_id 已登记过 → 重用对象键 + 重签 PUT URL（worker 续传）
+	if existing, err := s.store.GetEpisodeByTask(ctx, req.TaskId); err != nil {
+		return nil, fmt.Errorf("lookup episode by task %s: %w", req.TaskId, err)
+	} else if existing != nil {
+		url, err := s.r2.PresignPut(ctx, existing.ObjectKey, req.ContentLength)
+		if err != nil {
+			return nil, fmt.Errorf("presign episode put %s: %w", existing.ObjectKey, err)
+		}
+		log.Printf("[episode] 幂等重发 worker=%s task=%s -> 复用 %s", req.WorkerId, req.TaskId, existing.ObjectKey)
+		return &pb.EpisodeAck{Accepted: true, UploadUrl: url, ObjectKey: existing.ObjectKey, Message: "duplicate_replay"}, nil
 	}
 	objID, err := newID()
 	if err != nil {

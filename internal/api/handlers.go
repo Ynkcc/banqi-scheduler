@@ -17,6 +17,8 @@ const (
 	defaultEpisodeLimit = 100
 	maxEpisodeLimit     = 500
 	maxControlBody      = 4096
+	// 训练配置覆盖项：可调字段约 30 项，控制请求体的 4KB 上限放不下。
+	maxTrainConfigBody = 16384
 	// 绝对强度评估：明细与趋势各取多少条（趋势用于画版本曲线，无需全量）
 	evalLatestLimit = 200
 	evalTrendLimit  = 50
@@ -452,5 +454,41 @@ func (s *Server) handleControl(w http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("[webui] eval should_stop 已清除（确认续训）")
 	}
+	writeJSON(w, http.StatusOK, okView{OK: true})
+}
+
+// trainConfigView 训练配置面板视图：当前覆盖项 + 可调字段清单。字段清单来自调度器
+// 的白名单，前端因此不必硬编码字段名，新增可调项无需改前端。
+type trainConfigView struct {
+	Overrides map[string]string            `json:"overrides"`
+	Fields    []scheduler.TrainConfigField `json:"fields"`
+}
+
+// trainConfigRequest 是 PUT /api/train-config 的请求体：**全量替换**语义，
+// 未出现的字段即删除覆盖、回落 trainer 本地配置（空对象 = 清空全部覆盖）。
+type trainConfigRequest struct {
+	Overrides map[string]string `json:"overrides"`
+}
+
+func (s *Server) handleTrainConfigGet(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, trainConfigView{
+		Overrides: s.sched.Control().TrainConfig(),
+		Fields:    scheduler.TrainConfigFields(),
+	})
+}
+
+// handleTrainConfigPut 全量替换训练配置覆盖项；字段名与取值由白名单校验，非法输入
+// 直接 400 回显原因（不静默丢弃，也不落库半套配置）。
+func (s *Server) handleTrainConfigPut(w http.ResponseWriter, r *http.Request) {
+	var req trainConfigRequest
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxTrainConfigBody)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+	if err := s.sched.Control().SetTrainConfig(r.Context(), req.Overrides); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	log.Printf("[webui] train_config 已更新 %d 项: %v", len(req.Overrides), req.Overrides)
 	writeJSON(w, http.StatusOK, okView{OK: true})
 }

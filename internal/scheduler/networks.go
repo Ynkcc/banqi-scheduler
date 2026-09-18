@@ -89,6 +89,11 @@ func (s *Server) RegisterNetwork(ctx context.Context, req *pb.RegisterNetworkReq
 }
 
 // ReportMatchResult 累计五项成对计数 → GSPRT 判停 → 晋级/拒绝 best 指针。
+//
+// 任务级幂等：同 task_id 已 Done 的重复上报直接返回「already_reported」。
+// 否则会出问题——rating 路径下 pairs 会被累加（重复上报把胜率推高），eval 路径下
+// 判据会被重复触发（重复置位 should_stop）。doneTaskRetention（30m）正是为这种
+// 重试保留判据窗口：worker 看到的 ack 与服务端是否已处理过一一对应。
 func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*pb.MatchResultAck, error) {
 	task, ok := s.lookupTask(req.TaskId)
 	if !ok {
@@ -97,9 +102,12 @@ func (s *Server) ReportMatchResult(ctx context.Context, req *pb.MatchResult) (*p
 	if task.WorkerID != req.WorkerId {
 		return &pb.MatchResultAck{Accepted: false, Message: fmt.Sprintf("worker_mismatch task_owner=%s got=%s", task.WorkerID, req.WorkerId)}, nil
 	}
+	// 幂等闸口：同 task_id 已上报过 → 直接短路，不进任何聚合/落库路径。
+	if task.Done {
+		return &pb.MatchResultAck{Accepted: true, Message: "already_reported:" + req.TaskId}, nil
+	}
 	// 评估任务：只落 eval_results 并更新「无提升」判据，不参与 GSPRT 与晋级（见 eval.go）。
-	// 收尾（移出队列 + 释放在飞认领）由 reportEvalResult 同锁完成，此处不提前 markTaskDone:
-	// 提前释放会留下「不在飞但仍在队列」的窗口，导致同一 (network, spec) 被重复下发。
+	// 收尾（移出队列 + 释放在飞认领）由 reportEvalResult 完成；本次上报判定为首次（见上方 Done 闸口）。
 	if task.Kind == pb.TaskKind_TASK_EVAL {
 		return s.reportEvalResult(ctx, task, req)
 	}

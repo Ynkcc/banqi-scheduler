@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,8 @@ const (
 	// evalMaxAttempts：同一 (network, spec) 连续下发未上报的次数上限；超过即丢弃该任务
 	// 并告警 —— 否则旧版 worker 会让 eval 任务永久占住 GetTask 队首、把自对弈饿死。
 	evalMaxAttempts = 3
+	// evalPromotionsKey 节流计数器在 settings 表的键名。onNewBest 与 New（启动恢复）共用。
+	evalPromotionsKey = "eval_promotions"
 )
 
 // pendingEval 是一条待下发的评估任务：被测网络 × 对手标识。
@@ -86,6 +89,11 @@ func ValidateEvalOpponents(specs []string) error {
 }
 
 // onNewBest best 指针变更后调用：按 EvalEveryNPromotions 节流为各配置对手入队评估。
+//
+// 节流计数器同时维护在内存（s.evalPromotions）与 DB（settings.eval_promotions）。
+// 内存为运行期唯一真相源；DB 仅为重启恢复点。重启后计数减少意味着「曾触发过
+// 1/N 的那次晋级被遗忘了」，但已被触发的 eval 任务已写入 eval_queue——重启后
+// GetTask 会继续派发，enqueueEval 在已入队场景下 no-op，不会重复。
 func (s *Server) onNewBest(ctx context.Context, sha string) {
 	if !s.cfg.EvalEnabled || len(s.cfg.EvalOpponents) == 0 || sha == "" {
 		return
@@ -98,10 +106,14 @@ func (s *Server) onNewBest(ctx context.Context, sha string) {
 	s.evalPromotions++
 	due := s.evalPromotions%every == 0
 	s.mu.Unlock()
+	// DB 计数器写在外面，仅作恢复点：失败不阻断（行为由内存计数器与已入队的队列决定）
+	if _, err := s.store.IncSetting(ctx, evalPromotionsKey); err != nil {
+		log.Printf("[eval] ⚠️ 持久化节流计数器失败（忽略）：%v", err)
+	}
 	if !due {
 		return
 	}
-	if n := s.enqueueEval(sha, s.cfg.EvalOpponents); n > 0 {
+	if n := s.enqueueEval(ctx, sha, s.cfg.EvalOpponents); n > 0 {
 		log.Printf("[eval] 入队 network=%s 对手=%v（%d 条；节流 1/%d 次晋级；模式=%s）",
 			sha, s.cfg.EvalOpponents, n, every, s.evalModeName())
 	}
@@ -138,20 +150,78 @@ func (s *Server) ensureBestEvaluated(ctx context.Context) {
 	if len(missing) == 0 {
 		return
 	}
-	if n := s.enqueueEval(best.Sha, missing); n > 0 {
+	if n := s.enqueueEval(ctx, best.Sha, missing); n > 0 {
 		log.Printf("[eval] 启动补齐当前 best=%s 的缺失评估：%v", best.Sha, missing)
 	}
 }
 
+// loadEvalQueue 启动时把上次进程退出前未收尾的 eval 待办从 DB 拉回内存。
+//
+// 顺序重要：先于 ensureBestEvaluated，否则「同 best 同 spec」会同时出现在 in-flight
+// 队列与补充队列，造成任务歧义。counter 与 queue 一起恢复，避免「重启后忘了
+// 已触发 N 次中的第几次」导致节流相位错位（虽然不会丢任务，但会让 onNewBest 的
+// 1/N 触发更密）。
+func (s *Server) loadEvalQueue(ctx context.Context) error {
+	entries, err := s.store.LoadEvalQueue(ctx)
+	if err != nil {
+		return err
+	}
+	counter, err := s.loadEvalPromotions(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.evals = make([]*pendingEval, 0, len(entries))
+	for _, e := range entries {
+		s.evals = append(s.evals, &pendingEval{
+			NetworkSha: e.NetworkSha, Spec: e.Spec, Attempts: e.Attempts, CreatedAt: e.CreatedAt,
+		})
+	}
+	s.evalPromotions = counter
+	return nil
+}
+
+// loadEvalPromotions 读取 settings.eval_promotions 计数器；缺键视为 0。
+func (s *Server) loadEvalPromotions(ctx context.Context) (int, error) {
+	v, err := s.store.GetSetting(ctx, evalPromotionsKey)
+	if err != nil {
+		return 0, fmt.Errorf("read %s: %w", evalPromotionsKey, err)
+	}
+	if v == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("[eval] ⚠️ %s 计数器格式非法 %q，按 0 计数", evalPromotionsKey, v)
+		return 0, nil
+	}
+	return n, nil
+}
+
 // enqueueEval 为指定网络的各对手入队评估任务；已在队/已下发的 (network, spec) 跳过。
 // 返回新入队条数。
-func (s *Server) enqueueEval(sha string, specs []string) int {
+//
+// 持久化：每次 append 前 INSERT OR IGNORE eval_queue。已存在则 no-op，attempted>0 也照
+// 样保留——这是重启后恢复「曾下发但未上报」的关键。INSERT 在 s.mu 保护下序列化，多个
+// 入队调用并发安全。
+func (s *Server) enqueueEval(ctx context.Context, sha string, specs []string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := 0
 	for _, spec := range specs {
 		spec = strings.TrimSpace(spec)
 		if spec == "" || s.evalQueuedLocked(sha, spec) {
+			continue
+		}
+		inserted, err := s.store.EnqueueEvalQueue(ctx, sha, spec)
+		if err != nil {
+			log.Printf("[eval] ⚠️ 入队 %s/%s 持久化失败（跳过该条）：%v", sha, spec, err)
+			continue
+		}
+		if !inserted {
+			// 理论上不应发生（已用 evalQueuedLocked 过滤），但 DB 行已存在时也不重入队列——
+			// 留给启动补齐阶段 loadEvalQueue 拉回来即可。
 			continue
 		}
 		s.evals = append(s.evals, &pendingEval{NetworkSha: sha, Spec: spec, CreatedAt: time.Now()})
@@ -178,7 +248,11 @@ func (s *Server) evalQueuedLocked(sha, spec string) bool {
 //
 // 队首连续 evalMaxAttempts 次下发未上报即丢弃并告警：旧版 worker 不认识 TASK_EVAL
 // （会安全降级为「无任务」），若一直重试会把自对弈饿死。
-func (s *Server) claimEvalTask(workerID string) (*pendingEval, string) {
+//
+// 持久化：attempts++ 与丢弃行同步写 eval_queue。attempts 计数跨重启生效——
+// 进程崩溃前已下发 1 次的条目，重启后 s.evals[0].Attempts = 1，claim 时变 2，
+// 接近上限时更快触发丢弃，避免「反复下发又反复掉线」的抖动。
+func (s *Server) claimEvalTask(ctx context.Context, workerID string) (*pendingEval, string) {
 	if !s.cfg.EvalEnabled {
 		return nil, ""
 	}
@@ -194,6 +268,9 @@ func (s *Server) claimEvalTask(workerID string) (*pendingEval, string) {
 		job := s.evals[0]
 		if job.Attempts >= evalMaxAttempts {
 			s.evals = s.evals[1:]
+			if err := s.store.DeleteEvalQueue(ctx, job.NetworkSha, job.Spec); err != nil {
+				log.Printf("[eval] ⚠️ 丢弃任务时清理 eval_queue 失败（重启后会再丢一次）：%v", err)
+			}
 			log.Printf("[eval] ⚠️ 丢弃评估任务 network=%s opponent=%s：连续 %d 次下发未上报"+
 				"（collector 版本过旧不认 TASK_EVAL？或 worker 反复掉线）",
 				job.NetworkSha, job.Spec, job.Attempts)
@@ -202,7 +279,13 @@ func (s *Server) claimEvalTask(workerID string) (*pendingEval, string) {
 		if s.evalInFlightLocked(job.NetworkSha, job.Spec, now) {
 			return nil, ""
 		}
-		job.Attempts++
+		attempts, err := s.store.IncEvalQueueAttempts(ctx, job.NetworkSha, job.Spec)
+		if err != nil {
+			// DB 写失败：保守按内存计数递增，避免重启后计数倒退
+			log.Printf("[eval] ⚠️ 持久化 attempts 失败（按内存递增）：%v", err)
+			attempts = job.Attempts + 1
+		}
+		job.Attempts = attempts
 		s.tasks[taskID] = &runningTask{
 			Kind:         pb.TaskKind_TASK_EVAL,
 			NetworkSha:   job.NetworkSha,
@@ -225,10 +308,17 @@ func (s *Server) releaseEvalClaim(taskID string) {
 
 // finishEvalTask 收尾一次评估：移出待办队列 **且** 释放在飞认领，在同一把锁内完成。
 //
-// 顺序同样关键：若先释放认领、后移出队列（两者之间还有 DB 往返），那块窗口里
-// 「任务不在飞 + 待办仍在队列」会让 GetTask 再次下发同一 (network, spec) ——
-// 实测复现过：同一次评测被下发两次、两条结果互相覆盖。
-func (s *Server) finishEvalTask(taskID, sha, spec string) {
+// 调用前置条件：reportEvalResult 已把 UpsertEvalResult 写库成功（或判定为部分结果
+// 丢弃）。这样顺序保证 task.Done=true ⟺ DB 已有最新行，ReportMatchResult 的入口幂等闸口
+// 才能用 Done 作为「已上报」的唯一判据。
+//
+// 顺序同样关键：移出待办 + 置 Done 在同一把锁内完成，避免「任务不在飞 + 待办仍在队列」
+// 窗口下 GetTask 重复下发同 (network, spec) —— 实测复现过：同一次评测被下发两次、
+// 两条结果互相覆盖。
+//
+// 持久化：DELETE FROM eval_queue 在锁内同步执行，保证重启后 loadEvalQueue 不会把
+// 已上报的 (network, spec) 重新入队。
+func (s *Server) finishEvalTask(ctx context.Context, taskID, sha, spec string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for i, job := range s.evals {
@@ -239,6 +329,9 @@ func (s *Server) finishEvalTask(taskID, sha, spec string) {
 	}
 	if t, ok := s.tasks[taskID]; ok {
 		t.Done = true
+	}
+	if err := s.store.DeleteEvalQueue(ctx, sha, spec); err != nil {
+		log.Printf("[eval] ⚠️ 收尾时清理 eval_queue 失败（重启后可能再派一次，已被 (network,spec) UNIQUE 拦截）：%v", err)
 	}
 }
 
@@ -364,17 +457,22 @@ func (s *Server) evalTask(ctx context.Context, taskID string, job *pendingEval, 
 //
 // 部分结果不劣化已有结果：同 (network, spec) 只在本次局数不少于已有行时才覆盖
 // （重下发 / worker 中途失败可能只带回部分局数）。
+//
+// 顺序很关键：UpsertEvalResult 必须先于 finishEvalTask（移出队列 + 置 Done）。
+// 颠倒会让 finishEvalTask 留下一个「已 Done 但 DB 未写」的间隙——同 task_id 重试
+// 命中 ReportMatchResult 入口的幂等闸口后会被当作「已上报」丢弃，造成数据丢失。
+// 而当前的顺序里 finishEvalTask 时 s.tasks.Done=false + s.evals 仍有该 (network, spec)
+// → evalInFlightLocked 仍返回 true，GetTask 不会重复下发，幂等闸口也不会误命中。
 func (s *Server) reportEvalResult(ctx context.Context, task *runningTask, req *pb.MatchResult) (*pb.MatchResultAck, error) {
 	spec := strings.TrimSpace(req.OpponentSpec)
 	if spec == "" {
 		spec = task.OpponentSpec
 	}
-	// 收尾放在最前，且「移出待办队列」与「释放在飞认领」同锁完成（见 finishEvalTask）：
-	// 先把两者一起清掉，后续 DB 写入期间不会再被 GetTask 重复下发。
-	s.finishEvalTask(req.TaskId, task.NetworkSha, spec)
 
 	n := int(req.Games)
 	if n <= 0 {
+		// 终态：即便不上报数据也要收尾（避免队列卡住）
+		s.finishEvalTask(ctx, req.TaskId, task.NetworkSha, spec)
 		log.Printf("[eval] ⚠️ 上报 0 局，忽略 network=%s opponent=%s", task.NetworkSha, spec)
 		return &pb.MatchResultAck{Accepted: true, Message: "eval_zero_games_ignored"}, nil
 	}
@@ -383,6 +481,8 @@ func (s *Server) reportEvalResult(ctx context.Context, task *runningTask, req *p
 		return nil, err
 	}
 	if prev != nil && prev.NumGames > n {
+		// 部分结果不覆盖：仍要收尾，否则 (network, spec) 永远留在队列里
+		s.finishEvalTask(ctx, req.TaskId, task.NetworkSha, spec)
 		log.Printf("[eval] 忽略局数更少的评估结果 network=%s opponent=%s games=%d < 已有 %d",
 			task.NetworkSha, spec, n, prev.NumGames)
 		return &pb.MatchResultAck{Accepted: true, Message: "eval_partial_result_ignored"}, nil
@@ -401,6 +501,8 @@ func (s *Server) reportEvalResult(ctx context.Context, task *runningTask, req *p
 	if err := s.store.UpsertEvalResult(ctx, row); err != nil {
 		return nil, err
 	}
+	// DB 写入已落库，再做收尾：此后 Done=true 即可被外层幂等闸口安全用作「已上报」标记
+	s.finishEvalTask(ctx, req.TaskId, task.NetworkSha, spec)
 	log.Printf("[eval] ✅ network=%s opponent=%s %d 局 胜%d 平%d 负%d 胜率%.1f%% 步均%.1f",
 		task.NetworkSha, spec, n, row.Wins, row.Draws, row.Losses, 100*row.WinRate(), row.AvgMoves)
 	s.judgeEvalProgress(ctx, spec)

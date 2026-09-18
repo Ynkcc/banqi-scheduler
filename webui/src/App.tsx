@@ -5,6 +5,7 @@ import Eval from './pages/Eval'
 import Matches from './pages/Matches'
 import Networks from './pages/Networks'
 import Overview from './pages/Overview'
+import TrainConfig from './pages/TrainConfig'
 import Workers from './pages/Workers'
 
 const menuItems = [
@@ -12,6 +13,7 @@ const menuItems = [
   { key: '/networks', label: <Link to="/networks">网络</Link> },
   { key: '/matches', label: <Link to="/matches">对战 / SPRT</Link> },
   { key: '/eval', label: <Link to="/eval">绝对强度</Link> },
+  { key: '/train-config', label: <Link to="/train-config">训练超参</Link> },
   { key: '/workers', label: <Link to="/workers">Worker</Link> },
   { key: '/episodes', label: <Link to="/episodes">Episode</Link> },
 ]
@@ -33,6 +35,7 @@ export default function App() {
             <Route path="/networks" element={<Networks />} />
             <Route path="/matches" element={<Matches />} />
             <Route path="/eval" element={<Eval />} />
+            <Route path="/train-config" element={<TrainConfig />} />
             <Route path="/workers" element={<Workers />} />
             <Route path="/episodes" element={<Episodes />} />
             <Route path="*" element={<Navigate to="/" replace />} />

@@ -1,4 +1,14 @@
-import type { DataKind, EpisodePage, EvalView, Match, Network, RunningTask, Status, WorkerInfo } from './types'
+import type {
+  DataKind,
+  EpisodePage,
+  EvalView,
+  Match,
+  Network,
+  RunningTask,
+  Status,
+  TrainConfigView,
+  WorkerInfo,
+} from './types'
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
@@ -38,5 +48,12 @@ export const api = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+    }),
+  trainConfig: () => request<TrainConfigView>('/api/train-config'),
+  setTrainConfig: (overrides: Record<string, string>) =>
+    request<{ ok: boolean }>('/api/train-config', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ overrides }),
     }),
 }

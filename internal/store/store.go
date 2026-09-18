@@ -15,6 +15,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"log"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -155,6 +156,16 @@ func (s *Store) migrate(ctx context.Context) error {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
+		// eval_queue：进程重启后必须能恢复的待办评测。
+		// 主键 (network_sha, opponent_spec) 与 eval_results.UNIQUE 同语义——同 (best, 规则)
+		// 同时只能有一行「待办」与一条「结果」，重叠由 GetEvalResult 的 UNIQUE 兜底。
+		`CREATE TABLE IF NOT EXISTS eval_queue (
+			network_sha TEXT NOT NULL,
+			opponent_spec TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (network_sha, opponent_spec)
+		)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
@@ -190,6 +201,13 @@ func (s *Store) migrate(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("exec %q: %w", q, err)
 		}
+	}
+	// 幂等保护：episodes.task_id 唯一约束，防止 ReportEpisode 重试产生重复行。
+	// 用 CREATE UNIQUE INDEX 而非 ALTER TABLE ADD CONSTRAINT（SQLite 不支持后者）。
+	// 现有数据已有重复 task_id 时建索引会失败——这是数据污染的信号，降级为应用层查重
+	// （GetEpisodeByTask 仍工作），不阻断启动。
+	if _, err := s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_episodes_task_id_unique ON episodes(task_id)`); err != nil {
+		log.Printf("[store] ⚠️ 创建 episodes.task_id 唯一索引失败（%v）；现有数据可能含重复 task_id，幂等保护降级为应用层查重", err)
 	}
 	return nil
 }
@@ -253,4 +271,32 @@ func (s *Store) SetSetting(ctx context.Context, key, value string) error {
 		return fmt.Errorf("set setting %s=%s: %w", key, value, err)
 	}
 	return nil
+}
+
+// IncSetting 原子地将键值视为整数自增；用于 eval_promotions 等单调计数器。
+// 不存在的键从 0 起计。原子语义保证多 goroutine 并发自增不丢更新（SQLite WAL
+// 单写者即可序列化）。
+func (s *Store) IncSetting(ctx context.Context, key string) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	var cur int
+	err = tx.QueryRowContext(ctx, `SELECT COALESCE(
+		(SELECT CAST(value AS INTEGER) FROM settings WHERE key = ?), 0)`, key).Scan(&cur)
+	if err != nil {
+		return 0, fmt.Errorf("read counter %s: %w", key, err)
+	}
+	cur++
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, fmt.Sprintf("%d", cur)); err != nil {
+		return 0, fmt.Errorf("write counter %s: %w", key, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return cur, nil
 }

@@ -61,7 +61,7 @@ func (s *Server) GetTask(ctx context.Context, req *pb.TaskRequest) (*pb.TaskResp
 	// 放在重搜与自对弈之前：单批即含全部局数、成本低（纯策略 1000 局秒级），越早拿到趋势
 	// 越能及早发现「练了很久却没变强」——这正是相对门禁结构上测不出来的东西。
 	// 受 EvalEnabled / (network,spec) 在飞保护 / 下发次数上限约束；认领是原子的（见 claimEvalTask）。
-	if job, taskID := s.claimEvalTask(req.WorkerId); job != nil {
+	if job, taskID := s.claimEvalTask(ctx, req.WorkerId); job != nil {
 		resp, err := s.evalTask(ctx, taskID, job, req)
 		if err != nil {
 			// 组装失败（如网络已被清理）：释放本次认领，队列保留待下轮重试

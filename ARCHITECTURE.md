@@ -21,13 +21,13 @@
 | `internal/store` | SQLite 元数据，全部方法以 `context` 为首参；文件按表拆分：`store.go`（连接/迁移/统计/设置）、`networks.go`、`matches.go`、`eval.go`（绝对强度评估结果与趋势，**无外键**——规则对手没有 networks 行）、`episodes.go`、`workers.go`；迁移用 `pragma_table_info` 探测列存在性，best 指针事务切换 |
 | `internal/r2` | 预签名 PUT/GET，键布局 `episodes/<sha>/*.epb.gz`（EpisodeBatch 二进制记录）、`networks/<sha>.<format>`（扩展名 = 权重格式 onnx/pt/nnue，worker 据此分派加载器） |
 | `internal/sprt` | 五项 GSPRT（正态近似 LLR，elo0/elo1/alpha/beta 可配，含单测） |
-| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask，下发 `network_key`/`opponent_key`）、`networks.go`（登记/晋级/gatekeeper 判停 + 权重格式白名单校验）、`episodes.go`（episode 登记与 trainer 数据面）、`reanalysis.go`（局面重搜任务队列：SubmitReanalysis 入队 + 按间隔节流下发）、`eval.go`（绝对强度评估编排：晋级触发/TASK_EVAL 下发/结果落库/「连续 N 次无提升」判据与停机置位）、`control.go`（运行时控制 + 停机信号，落库 settings） |
+| `internal/scheduler` | gRPC 服务实现 + 内存任务表（task↔worker 归属校验、rating 在飞判定、超期回收）；文件按职责拆分：`server.go`（运行状态与全局 RPC）、`tasks.go`（GetTask/ratingTask，下发 `network_key`/`opponent_key`）、`networks.go`（登记/晋级/gatekeeper 判停 + 权重格式白名单校验）、`episodes.go`（episode 登记与 trainer 数据面）、`reanalysis.go`（局面重搜任务队列：SubmitReanalysis 入队 + 按间隔节流下发）、`eval.go`（绝对强度评估编排：晋级触发/TASK_EVAL 下发/结果落库/「连续 N 次无提升」判据与停机置位）、`trainconfig.go`（可远程调整训练超参的白名单 + 归一化/范围校验，见 §5.1）、`control.go`（运行时控制 + 停机信号 + 训练超参覆盖，落库 settings） |
 | `internal/api` | WebUI 的 JSON API + 控制端点 + embed 前端产物（`HTTPServer(addr)` 交由调用方启停，同进程 http.Server） |
 | `webui/` | React 18 + Vite + TS + AntD 前端源码，构建产物输出到 `internal/api/dist` |
 | `pb/` | protoc 生成代码（不提交） |
 | `proto/scheduler.proto` | 契约源文件（已随拆分迁入；主仓库 `build.rs` 仍编译自己的 `proto/scheduler.proto` 副本，proto 变更需双侧同步） |
 
-## 3. gRPC 契约（scheduler.proto，10 RPC）
+## 3. gRPC 契约（scheduler.proto，11 RPC）
 
 - `GetTask`：worker 按机器规格拉任务（优先 gatekeeper rating，其次**绝对强度评估 TASK_EVAL**（见 §3.2），再次**局面重搜 reanalysis**（按间隔节流，见 §3.1），最后 best 网络 selfplay），按 worker 线程数缩放下发局数（`SCHEDULER_THREADS_BASELINE`）；恒下发网络对象键 `network_key`（rating 任务另含 `opponent_key`），下载 URL 仅在 worker 需要拉取时签发；selfplay 与 rating 均在 `SelfPlayParams.extra_config` 下发课程参数 `{"initial_revealed_pieces":N}`（<=0 不下发，worker 用变体默认值）——课程阶段切换可改 `SCHEDULER_INITIAL_REVEALED` 重启调度器，也可经 WebUI 在线切换（见 §5），worker 无需重编译；selfplay 另经 `SelfPlayParams.data_kind` 下发**数据类别**（`SCHEDULER_DATA_KIND` / WebUI，见 `DataKind`），worker 据此产出对应类别的记录；`TASK_REANALYSIS` 任务经 `reanalysis_payload` 下发历史局面载荷（恒用 `DATA_RESNET`，与 selfplay 的类别切换无关），其 `games` 字段表示位置条数；
 - `ReportEpisode`：只收元数据（含数据类别 `kind`，落库 `episodes.kind`），签发 R2 预签名 PUT（对象键 `episodes/<sha>/<id>.epb.gz`），数据直传 R2（校验 task↔worker 归属）；
@@ -38,7 +38,8 @@
 - `SignNetworkUpload`：trainer 请求网络直传预签名 PUT（须声明权重格式 `format`，对象键 `networks/<sha>.<format>`）；
 - `ListEpisodes`：trainer 游标分页拉 episode 预签名 GET 列表（游标为上次返回的对象键，服务端据此解析 `episodes.id` 并按登记顺序推进，不依赖对象键字典序）；可带 `kind` 只取某一数据类别（缺省不过滤），消费方据此避免下载无法消费的对象；
 - `GetInfo`：返回 `variant`（变体类型由服务端下发，`SCHEDULER_VARIANT` 配置）与 **`should_stop` / `stop_reason`**（绝对强度判据置位的停机信号，trainer 按 `SHOULD_STOP_POLL_SECONDS` 轮询后优雅停止，见 §3.2）；
-- `SubmitReanalysis`：trainer 提交一批**待重搜局面**（异步：入队后由 `GetTask` 分发给任意 worker）。拒绝情形：未启用（`SCHEDULER_REANALYSIS_INTERVAL_TASKS=0`）、变体与服务端不一致（防串变体）、载荷为空、队列满（不丢已有条目）。
+- `SubmitReanalysis`：trainer 提交一批**待重搜局面**（异步：入队后由 `GetTask` 分发给任意 worker）。拒绝情形：未启用（`SCHEDULER_REANALYSIS_INTERVAL_TASKS=0`）、变体与服务端不一致（防串变体）、载荷为空、队列满（不丢已有条目）；
+- `GetTrainConfig`：trainer 启动引导与轮询拉取**可远程调整的训练超参**（见 §5.1）。变体不符时 `accepted=false` 并附说明（不返回覆盖值），否则 `accepted=true` + `overrides`（仅覆盖项，全量替换语义）。
 
 **安全约定**：R2 凭据只在调度器持有，worker/trainer 零存储配置，全部经预签名 URL 上下行。
 
@@ -79,7 +80,7 @@ protoc --proto_path=proto --go_out=. --go_opt=module=banqi/server \
 
 ## 5. WebUI（同进程 HTTP，默认仅本机）
 
-`cmd/scheduler` 在同一进程内起 `http.Server`（`SCHEDULER_HTTP_ADDR`，默认 `127.0.0.1:8080`），复用同一 `store` 与 `scheduler.Server` 状态，不经过 gRPC，无鉴权。WebUI 监听失败只记日志，不影响 gRPC 调度。
+`cmd/scheduler` 在同一进程内起 `http.Server`（`SCHEDULER_HTTP_ADDR`，默认 `127.0.0.1:9536`），复用同一 `store` 与 `scheduler.Server` 状态，不经过 gRPC，无鉴权。WebUI 监听失败只记日志，不影响 gRPC 调度。
 
 前端产物 embed 进二进制，构建顺序与「先 protoc 生成 `pb/`」一致：
 
@@ -99,6 +100,7 @@ go build ./cmd/scheduler
 | `GET /api/workers` | Worker 列表与在线判定（`SCHEDULER_WORKER_ONLINE_SECONDS`，默认 60s） |
 | `GET /api/episodes?before=&limit=` | episode 元数据按 id 倒序分页 |
 | `GET /api/tasks` | 进程内进行中任务快照 |
+| `GET /api/train-config` | 可远程调整的训练超参：字段清单（名称/类型/取值约束）+ 当前覆盖值。清单即白名单投影，前端据此渲染表单，无需硬编码字段名与范围（见 §5.1） |
 
 控制接口（写入 `settings` 表并跨重启保留；环境变量仅在库中无记录时作为初始值）：
 
@@ -106,10 +108,26 @@ go build ./cmd/scheduler
 |---|---|
 | `POST /api/networks/{sha}/promote` | 手动晋级 best |
 | `POST /api/control` | `{"paused":bool}` 暂停 selfplay（rating 继续：`GetTask` 只回 rating、`Heartbeat` 回 `pause_self_play`）；`{"initialRevealed":int}` 在线切换课程阶段，经 `extra_config` 下发；`{"dataKind":"resnet"\|"nnue"}` 在线切换自对弈产出的数据类别，经 `SelfPlayParams.data_kind` 下发；`{"clearStop":true}` 清除绝对强度判据置位的停机信号（确认续训） |
+| `PUT /api/train-config` | `{"overrides":{...}}` 全量替换训练超参覆盖（空对象 = 清除全部覆盖，回落本地值）。校验失败返回 400，不落库（见 §5.1） |
 
-前端页面：总览 / 网络 / 对战·SPRT / **绝对强度** / Worker / Episode。「绝对强度」页展示停机横幅（含一键清除）、评估配置、按对手的版本趋势（含零依赖 SVG 迷你趋势图）与评估明细。
+前端页面：总览 / 网络 / 对战·SPRT / **绝对强度** / **训练超参** / Worker / Episode。「绝对强度」页展示停机横幅（含一键清除）、评估配置、按对手的版本趋势（含零依赖 SVG 迷你趋势图）与评估明细。「训练超参」页（`pages/TrainConfig.tsx`）按 `fields` 清单动态渲染编辑控件（bool/enum 用 Select、int/float 用 InputNumber 并按 `min`/`max` 约束），留空即删除覆盖，提交为全量替换；轮询只刷新服务端快照，不覆盖正在编辑的草稿（见 §5.1）。
 
 内存任务表保留策略（见 `internal/scheduler/server.go`）：tasks 仅用于 task↔worker 归属校验与 rating 在飞判定，进度以 DB 为准；已上报结束（`Done`）的记录保留 `doneTaskRetention`(30m)、未上报记录最多保留 `taskMaxRetention`(24h)，由 `pruneTasks` 在 `GetTask` 路径上按 `pruneInterval`(1m) 节流回收；`/api/tasks` 只展示未结束任务。
+
+### 5.1 可远程调整的训练超参
+
+**动机**：训练超参（学习率、目标函数权重、训练量、EMA、重搜节流等）原先固化在 trainer 本地 YAML，改动需登录训练机改文件并重启进程。改为调度器持有**覆盖项**作为唯一权威：WebUI / gRPC 写入，trainer 启动引导 + 轮询热更，无需重编译或重启训练。
+
+| 环节 | 行为 |
+|---|---|
+| 白名单 | `internal/scheduler/trainconfig.go` 的 `trainConfigSpecs`（约 30 字段，类型 float/int/bool/enum + 范围）。字段名与 `banqi_training.config.Config` 一一对应，**必须与 `banqi_training/config.py` 的 `TRAIN_CONFIG_OVERRIDABLE` 同步增删** |
+| 可调判据 | 不改模型结构、不依赖本地路径/设备、能在训练循环中热更。**排除**：结构开关（`HEALTH_VALUE_HEAD_ENABLED` / `VALUE_DIST_*` / `POLICY_TRUNK_INDEPENDENT`，与旧 checkpoint 不兼容）、路径与设备、构造期一次性资源（`MAX_SAMPLE_BUFFER_SIZE` / `REANALYSIS_POOL_SIZE`） |
+| 校验 | 非白名单字段直接报错（不静默丢弃）；数值域按 spec 校验；bool 只接受 `true/false`、`1/0`、`yes/no`、`on/off`（**刻意不复用 config.py `_cast_bool` 的「未知即真」容错**，远程写错必须报错）；enum 取值域与 `config.py` / `buffer.py` 的构造期校验对齐 |
+| 语义 | **全量替换**：`PUT /api/train-config` 的 `overrides` 即当前全部覆盖，未出现 = 删除该覆盖、回落 trainer 本地 YAML 值（空对象 = 清空全部覆盖） |
+| 落库/下发 | 落库 `settings.train_config`（JSON 对象，字段名 → 值字符串），跨重启保留；`GetTrainConfig` 只下发覆盖项，变体不符时 `accepted=false` 且不返回覆盖值 |
+| 引导 | trainer 构造 `TrainWorker` 前先 `snapshot_overridable(config)` 存本地基线，再拉覆盖并 `apply_overrides`（含基线即可在后续删除覆盖时回落）；主 CLI 经 `cfg_baseline` 把基线交给 worker |
+| 热更 | RPC/轮询线程只把覆盖登记到 `_pending_overrides`（锁保护），训练线程在**轮边界**（拉不到 episode 时）统一应用，避免与调度器/优化器争用；`lr_decay_batches` / `anneal_rounds` / `ema_decay` / 节流阈值等构造期快照一并重算，LR 调度器重建并 `scheduler.step(进度)` 保留训练进度 |
+| 容错 | 拉取失败只记日志并沿用上次覆盖，绝不中断训练；`SHOULD_STOP_POLL_SECONDS=0` 会同时关闭停机轮询与配置轮询（文档与日志均告警） |
 
 ## 6. 变更记录
 
@@ -144,3 +162,10 @@ go build ./cmd/scheduler
   - **编排**（`internal/scheduler/eval.go`）：best 晋级触发（按 `SCHEDULER_EVAL_EVERY_N_PROMOTIONS` 节流）+ 启动补齐；一次任务含全部局数；`(network,spec)` 在飞保护与 15m 失效判定；队首连续 3 次下发未上报即丢弃（防旧版 worker 饿死自对弈）；`reportEvalResult` 只落库不参与晋级，且部分结果不劣化完整结果；`judgeEvalProgress` 按「连续 N 次提升 < EPS」置位 `Control.SetStop`（落库 settings，跨重启保留，需显式 `clearStop`）。
   - **API/UI**：新增 `GET /api/eval`；`/api/status` 增加 `eval` 配置与 `shouldStop`/`stopReason`；`/api/control` 支持 `clearStop`；WebUI 新增「绝对强度」页。
   - **测试**：新增 `internal/store/eval_test.go`（去重覆盖 / 趋势序列 / 老库补表）、`internal/scheduler/eval_test.go`（节流去重 / 在飞 / 丢弃 / 判据 / 部分结果保护 / 进程内全链路）、`internal/api` 增补 `/api/eval` 与停机信号用例。
+- 2026-09-18：**新增可远程调整的训练超参**（见 §5.1）：
+  - **proto**：新增 `GetTrainConfig` RPC（trainer 引导 + 轮询拉取覆盖项）与 `GetTrainConfigRequest/Reply`（**11 RPC**）。三份 proto 副本已同步。
+  - **白名单与校验**（`internal/scheduler/trainconfig.go`）：`trainConfigSpecs`（约 30 字段，float/int/bool/enum + 范围），归一化即校验，非白名单字段/越界/非法枚举直接报错；bool 用严格写法（不复用 config.py 的「未知即真」容错）。落库 `settings.train_config`。
+  - **运行时**（`internal/scheduler/control.go`）：`Control` 持有 `trainConfig`，`loadControl` 重读时重新校验，`SetTrainConfig` 归一后落库。
+  - **API/UI**：新增 `GET /api/train-config`（字段清单 + 当前覆盖，前端无需硬编码字段名与范围）与 `PUT /api/train-config`（全量替换，非法 400 不落库）；`TrainConfigField` 随 spec 一并暴露 `min`/`max`/`hasMax`/`gtZero`/`enum` 供表单约束（权威校验仍在服务端）。WebUI 新增「训练超参」页。
+  - **测试**：新增 `internal/scheduler/trainconfig_test.go`（归一化 / 白名单拒绝 / 整批拒绝 / 字段清单 / 落库重载往返）、`internal/api/handlers_test.go::TestTrainConfigEndpoint`（JSON 契约与全量替换语义）；`go test ./...` 全绿。
+- 2026-09-18：WebUI 默认监听端口由 `127.0.0.1:8080` 改为 `127.0.0.1:9536`：`8080` 在部署机上已被既有服务占用，导致 WebUI 绑定失败（日志 `address already in use`，gRPC 调度不受影响）。`SCHEDULER_HTTP_ADDR` 仍可覆盖；同步 `config.example.env`、`webui/vite.config.ts` dev 代理与部署 README。

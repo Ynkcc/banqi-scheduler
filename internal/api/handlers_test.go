@@ -140,6 +140,72 @@ func TestControlEndpoint(t *testing.T) {
 	}
 }
 
+// 训练超参面板的数据契约：可调字段清单（含取值约束）+ 覆盖项全量替换语义。
+func TestTrainConfigEndpoint(t *testing.T) {
+	s, _ := newTestServer(t)
+
+	readView := func() map[string]any {
+		t.Helper()
+		rec := do(t, s, http.MethodGet, "/api/train-config", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET status=%d body=%s", rec.Code, rec.Body.String())
+		}
+		var view map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &view); err != nil {
+			t.Fatalf("json: %v", err)
+		}
+		return view
+	}
+
+	view := readView()
+	if overrides, ok := view["overrides"].(map[string]any); !ok || len(overrides) != 0 {
+		t.Errorf("初始 overrides 应为空对象, 实际 %v", view["overrides"])
+	}
+	fields, _ := view["fields"].([]any)
+	if len(fields) == 0 {
+		t.Fatal("fields 不得为空（前端据此渲染表单）")
+	}
+	byName := map[string]map[string]any{}
+	for _, f := range fields {
+		item, _ := f.(map[string]any)
+		byName[item["name"].(string)] = item
+	}
+	if lr := byName["LEARNING_RATE"]; lr == nil || lr["kind"] != "float" || lr["hasMax"] != true || lr["max"] != float64(1) {
+		t.Errorf("LEARNING_RATE 字段描述不符: %+v", lr)
+	}
+	if mode := byName["VALUE_TARGET_MODE"]; mode == nil || mode["kind"] != "enum" || len(mode["enum"].([]any)) == 0 {
+		t.Errorf("VALUE_TARGET_MODE 字段描述不符: %+v", mode)
+	}
+
+	// 合法下发生效（值为归一后的写法）
+	if rec := do(t, s, http.MethodPut, "/api/train-config", `{"overrides":{"LEARNING_RATE":"1e-3","VALUE_TARGET_MODE":"Game_HP"}}`); rec.Code != http.StatusOK {
+		t.Fatalf("PUT status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	overrides, _ := readView()["overrides"].(map[string]any)
+	if overrides["LEARNING_RATE"] != "0.001" || overrides["VALUE_TARGET_MODE"] != "game_hp" {
+		t.Errorf("下发后 overrides 不符: %v", overrides)
+	}
+
+	// 非白名单字段 / 非法取值 → 400，且不得改动已有覆盖
+	if rec := do(t, s, http.MethodPut, "/api/train-config", `{"overrides":{"NOPE":"1"}}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("非白名单字段应为 400, 实际 %d", rec.Code)
+	}
+	if rec := do(t, s, http.MethodPut, "/api/train-config", `{"overrides":{"TRAIN_BATCH":"0"}}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("越界取值应为 400, 实际 %d", rec.Code)
+	}
+	if overrides, _ := readView()["overrides"].(map[string]any); len(overrides) != 2 {
+		t.Errorf("非法输入不得改动覆盖: %v", overrides)
+	}
+
+	// 全量替换：空对象 = 清空覆盖，回落 trainer 本地配置
+	if rec := do(t, s, http.MethodPut, "/api/train-config", `{"overrides":{}}`); rec.Code != http.StatusOK {
+		t.Fatalf("清空 status=%d", rec.Code)
+	}
+	if overrides, _ := readView()["overrides"].(map[string]any); len(overrides) != 0 {
+		t.Errorf("清空后应无覆盖, 实际 %v", overrides)
+	}
+}
+
 // 绝对强度面板的数据契约：配置、按对手分组的升序趋势、无提升计数、停机信号与清除。
 func TestEvalEndpointAndStopFlag(t *testing.T) {
 	ctx := context.Background()

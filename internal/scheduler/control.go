@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -56,6 +57,9 @@ type Control struct {
 	dataKind        pb.DataKind
 	stopped         bool
 	stopReason      string
+	// trainConfig 训练配置覆盖项（字段名 → 值字符串），与 settingTrainConfig 落库同步。
+	// 只含调度器显式设置过的项；trainer 未收到的字段保持本地 YAML 的值。
+	trainConfig map[string]string
 }
 
 func loadControl(ctx context.Context, st *store.Store, defaultInitialRevealed int, defaultDataKind pb.DataKind) (*Control, error) {
@@ -95,6 +99,22 @@ func loadControl(ctx context.Context, st *store.Store, defaultInitialRevealed in
 		return nil, err
 	}
 	c.stopReason = reason
+	// 训练配置覆盖项：库中为 JSON 对象。重启后重新归一校验一次——下发端不再校验，
+	// 若库里被手改成非法值（字段名写错 / 超范围），必须在这里拦住而不是带病下发。
+	c.trainConfig = map[string]string{}
+	rawTrainConfig, err := st.GetSetting(ctx, settingTrainConfig)
+	if err != nil {
+		return nil, err
+	}
+	if rawTrainConfig != "" {
+		var stored map[string]string
+		if err := json.Unmarshal([]byte(rawTrainConfig), &stored); err != nil {
+			return nil, fmt.Errorf("setting %s=%q is not a JSON object: %w", settingTrainConfig, rawTrainConfig, err)
+		}
+		if c.trainConfig, err = normalizeTrainConfig(stored); err != nil {
+			return nil, fmt.Errorf("setting %s: %w", settingTrainConfig, err)
+		}
+	}
 	return c, nil
 }
 
@@ -195,5 +215,36 @@ func (c *Control) ClearStop(ctx context.Context) error {
 	}
 	c.stopped = false
 	c.stopReason = ""
+	return nil
+}
+
+// TrainConfig 当前训练配置覆盖项（副本；WebUI 与 GetTrainConfig 读取）。
+func (c *Control) TrainConfig() map[string]string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make(map[string]string, len(c.trainConfig))
+	for name, value := range c.trainConfig {
+		out[name] = value
+	}
+	return out
+}
+
+// SetTrainConfig 全量替换训练配置覆盖项。先归一校验再落库，避免把半套非法配置写进
+// settings（loadControl 会因它直接启动失败）。空映射 = 清空覆盖，回落 trainer 本地配置。
+func (c *Control) SetTrainConfig(ctx context.Context, overrides map[string]string) error {
+	normalized, err := normalizeTrainConfig(overrides)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return fmt.Errorf("序列化训练配置: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.store.SetSetting(ctx, settingTrainConfig, string(encoded)); err != nil {
+		return err
+	}
+	c.trainConfig = normalized
 	return nil
 }

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func TestEvalClaimIsAtomicAndExcludesInFlight(t *testing.T) {
 		t.Fatalf("应入队 2 条，实际 %d", n)
 	}
 
-	job, taskID := srv.claimEvalTask("w1")
+	job, taskID := srv.claimEvalTask(ctx, "w1")
 	if job == nil || job.NetworkSha != "sha1" || job.Spec != "random" {
 		t.Fatalf("队首应为 (sha1, random)，实际 %+v", job)
 	}
@@ -107,7 +108,7 @@ func TestEvalClaimIsAtomicAndExcludesInFlight(t *testing.T) {
 	}
 
 	// 在飞期间（上报前）不得重复认领同一 (network, spec)
-	if j2, _ := srv.claimEvalTask("w2"); j2 != nil {
+	if j2, _ := srv.claimEvalTask(ctx, "w2"); j2 != nil {
 		t.Fatalf("在飞时不应重复认领，实际 %+v", j2)
 	}
 
@@ -115,7 +116,7 @@ func TestEvalClaimIsAtomicAndExcludesInFlight(t *testing.T) {
 	srv.mu.Lock()
 	srv.tasks[taskID].CreatedAt = time.Now().Add(-2 * evalTaskStaleAfter)
 	srv.mu.Unlock()
-	job2, taskID2 := srv.claimEvalTask("w2")
+	job2, taskID2 := srv.claimEvalTask(ctx, "w2")
 	if job2 == nil || job2.Spec != "random" || taskID2 == taskID {
 		t.Fatalf("超期未上报应允许重认领，实际 %+v id=%s", job2, taskID2)
 	}
@@ -134,8 +135,8 @@ func TestEvalFinishReleasesQueueAndClaimTogether(t *testing.T) {
 	})
 	srv.onNewBest(ctx, "sha1")
 
-	_, taskID := srv.claimEvalTask("w1")
-	srv.finishEvalTask(taskID, "sha1", EvalOpponentCaptureFirst)
+	_, taskID := srv.claimEvalTask(ctx, "w1")
+	srv.finishEvalTask(ctx, taskID, "sha1", EvalOpponentCaptureFirst)
 
 	if n := srv.PendingEval(); n != 0 {
 		t.Errorf("收尾必须同时移出待办队列，实际剩 %d 条", n)
@@ -144,7 +145,7 @@ func TestEvalFinishReleasesQueueAndClaimTogether(t *testing.T) {
 		t.Errorf("收尾必须释放在飞认领（标记 Done），实际 %+v ok=%v", t2, ok)
 	}
 	// 队列已空 → 不可能再认领到同一任务（旧实现在此处会重复下发）
-	if j, _ := srv.claimEvalTask("w2"); j != nil {
+	if j, _ := srv.claimEvalTask(ctx, "w2"); j != nil {
 		t.Fatalf("收尾后不应再认领到任务，实际 %+v", j)
 	}
 }
@@ -160,7 +161,7 @@ func TestEvalDropsTaskAfterMaxAttempts(t *testing.T) {
 
 	// 队首（random）连续下发 evalMaxAttempts 次均无上报（每次当作超期失效）
 	for i := 0; i < evalMaxAttempts; i++ {
-		job, taskID := srv.claimEvalTask("w")
+		job, taskID := srv.claimEvalTask(ctx, "w")
 		if job == nil || job.Spec != "random" {
 			t.Fatalf("第 %d 次认领应拿到队首 random，实际 %+v", i+1, job)
 		}
@@ -169,7 +170,7 @@ func TestEvalDropsTaskAfterMaxAttempts(t *testing.T) {
 		srv.mu.Unlock()
 	}
 	// 达到上限 → 丢弃队首，返回下一条（capture_first）
-	next, _ := srv.claimEvalTask("w")
+	next, _ := srv.claimEvalTask(ctx, "w")
 	if next == nil || next.Spec != EvalOpponentCaptureFirst {
 		t.Fatalf("队首超次数应被丢弃并返回下一条（capture_first），实际 %+v", next)
 	}
@@ -238,7 +239,7 @@ func TestReportEvalResultPartialDoesNotDegrade(t *testing.T) {
 	srv, st := newEvalTestServer(t, Config{EvalEnabled: true, EvalNoProgressN: 0})
 	task := &runningTask{Kind: pb.TaskKind_TASK_EVAL, NetworkSha: "sha1", OpponentSpec: "rule:capture_first"}
 	srv.registerTask("t1", task)
-	srv.enqueueEval("sha1", []string{"rule:capture_first"})
+	srv.enqueueEval(ctx, "sha1", []string{"rule:capture_first"})
 
 	full := &pb.MatchResult{
 		TaskId: "t1", Kind: pb.TaskKind_TASK_EVAL, NetworkSha: "sha1",
@@ -391,5 +392,108 @@ func TestGetInfoCarriesShouldStop(t *testing.T) {
 	}
 	if rep, _ = srv.GetInfo(ctx, &pb.GetInfoRequest{}); rep.ShouldStop {
 		t.Error("清除后不应再下发 should_stop")
+	}
+}
+
+// 幂等闸口：ReportMatchResult 收到同 task_id 的二次上报时不应再走任何聚合/落库路径。
+// eval 路径已由 finishEvalTask 同步置 Done，重试直接返回「already_reported」，
+// 不会重复触发 judgeEvalProgress 把已置位的 should_stop 再发一遍告警。
+func TestReportMatchResultIsIdempotentForEval(t *testing.T) {
+	ctx := context.Background()
+	cfg := Config{
+		Variant:              "4x8",
+		EvalEnabled:          true,
+		EvalOpponents:        []string{EvalOpponentCaptureFirst},
+		EvalGames:            1000,
+		EvalEveryNPromotions: 1,
+		EvalNoProgressN:      3, // 故意打开判据，验证二次上报不会再触发
+		EvalNoProgressEps:    0.02,
+	}
+	srv, _ := newEvalTestServer(t, cfg)
+	if _, err := srv.RegisterNetwork(ctx, &pb.RegisterNetworkRequest{Sha: "sha-best", Format: "onnx"}); err != nil {
+		t.Fatalf("RegisterNetwork: %v", err)
+	}
+
+	// 拉取一个 TASK_EVAL，模拟 worker 拿到任务
+	req := &pb.TaskRequest{WorkerId: "w1", ClientVersion: "0.1.0", CurrentNetwork: "sha-best"}
+	resp, err := srv.GetTask(ctx, req)
+	if err != nil || resp.Kind != pb.TaskKind_TASK_EVAL {
+		t.Fatalf("GetTask 应下发 TASK_EVAL，实际 %+v err=%v", resp, err)
+	}
+
+	// 首次上报：evaluate 把 should_stop 置位
+	first := &pb.MatchResult{
+		WorkerId: "w1", TaskId: resp.TaskId, Kind: pb.TaskKind_TASK_EVAL,
+		NetworkSha: "sha-best", OpponentSpec: EvalOpponentCaptureFirst,
+		Games: 1000, Wins: 576, Draws: 0, Losses: 424, AvgMoves: 44.4,
+	}
+	rep1, err := srv.ReportMatchResult(ctx, first)
+	if err != nil || !rep1.Accepted {
+		t.Fatalf("首次上报：ack=%+v err=%v", rep1, err)
+	}
+	if srv.ctl.ShouldStop() {
+		t.Fatal("单次评估不应触发判据（仅 1 条记录，无对照）")
+	}
+
+	// 二次上报：必须命中幂等闸口，不能再次触达 judgeEvalProgress / UpsertEvalResult
+	stopReason := srv.ctl.StopReason()
+	dup := &pb.MatchResult{
+		WorkerId: "w1", TaskId: resp.TaskId, Kind: pb.TaskKind_TASK_EVAL,
+		NetworkSha: "sha-best", OpponentSpec: EvalOpponentCaptureFirst,
+		// 用「不一样的局数」试探：若没命中闸口，UpsertEvalResult 会用新 created_at 覆盖旧行
+		Games: 5000, Wins: 3000, Draws: 0, Losses: 2000, AvgMoves: 50.0,
+	}
+	rep2, err := srv.ReportMatchResult(ctx, dup)
+	if err != nil || !rep2.Accepted {
+		t.Fatalf("二次上报应返回 Accepted（幂等）：ack=%+v err=%v", rep2, err)
+	}
+	if !strings.Contains(rep2.Message, "already_reported") {
+		t.Errorf("二次上报应带 already_reported 标记，实际 message=%q", rep2.Message)
+	}
+	if srv.ctl.StopReason() != stopReason {
+		t.Errorf("二次上报不得覆盖 stop_reason：旧=%q 新=%q", stopReason, srv.ctl.StopReason())
+	}
+}
+
+// 顺序契约：UpsertEvalResult 必须在 finishEvalTask 之前，否则 Done=true 但 DB 未写，
+// 同 task_id 重试会被入口闸口丢成「已上报」造成数据丢失。
+func TestEvalUpsertBeforeFinishPreventsDataLossOnRetry(t *testing.T) {
+	ctx := context.Background()
+	srv, _ := newEvalTestServer(t, Config{
+		Variant: "4x8", EvalEnabled: true,
+		EvalOpponents: []string{EvalOpponentCaptureFirst},
+		EvalGames:     1000, EvalEveryNPromotions: 1, EvalNoProgressN: 0,
+	})
+	if _, err := srv.RegisterNetwork(ctx, &pb.RegisterNetworkRequest{Sha: "sha-best", Format: "onnx"}); err != nil {
+		t.Fatalf("RegisterNetwork: %v", err)
+	}
+
+	req := &pb.TaskRequest{WorkerId: "w1", ClientVersion: "0.1.0", CurrentNetwork: "sha-best"}
+	resp, err := srv.GetTask(ctx, req)
+	if err != nil || resp.Kind != pb.TaskKind_TASK_EVAL {
+		t.Fatalf("GetTask 应下发 TASK_EVAL，实际 %+v err=%v", resp, err)
+	}
+
+	// 模拟「首次上报成功 + 同 task_id 重试」：重试在 entry 闸口命中 Done 短路
+	rep := &pb.MatchResult{
+		WorkerId: "w1", TaskId: resp.TaskId, Kind: pb.TaskKind_TASK_EVAL,
+		NetworkSha: "sha-best", OpponentSpec: EvalOpponentCaptureFirst,
+		Games: 1000, Wins: 576, Draws: 0, Losses: 424, AvgMoves: 44.4,
+	}
+	if _, err := srv.ReportMatchResult(ctx, rep); err != nil {
+		t.Fatalf("首次上报失败: %v", err)
+	}
+	if rep2, err := srv.ReportMatchResult(ctx, rep); err != nil || !rep2.Accepted {
+		t.Fatalf("重试应被接受：ack=%+v err=%v", rep2, err)
+	} else if !strings.Contains(rep2.Message, "already_reported") {
+		t.Errorf("重试应带 already_reported 标记，实际 message=%q", rep2.Message)
+	}
+	// 数据必须已落库：证明 UpsertEvalResult 在 Done=true 之前执行
+	row, err := srv.store.GetEvalResult(ctx, "sha-best", EvalOpponentCaptureFirst)
+	if err != nil || row == nil {
+		t.Fatalf("数据丢失：GetEvalResult 返回 %+v err=%v", row, err)
+	}
+	if row.NumGames != 1000 || row.Wins != 576 {
+		t.Errorf("落库数据被重试覆盖：%+v", row)
 	}
 }
