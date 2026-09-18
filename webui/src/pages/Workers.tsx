@@ -6,6 +6,13 @@ import type { WorkerInfo } from '../types'
 import { usePoll } from '../usePoll'
 
 const columns: TableProps<WorkerInfo>['columns'] = [
+  {
+    title: '角色',
+    dataIndex: 'id',
+    width: 100,
+    render: (_: string, w: WorkerInfo) =>
+      w.id.startsWith('trainer-') ? <Tag color="purple">trainer</Tag> : <Tag color="blue">collector</Tag>,
+  },
   { title: 'worker', dataIndex: 'id' },
   {
     title: '在线',
